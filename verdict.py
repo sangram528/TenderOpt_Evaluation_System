@@ -1,57 +1,57 @@
 """
 verdict.py — CRPF Tender Evaluation
 =====================================
-Takes scanner output for a tender + bidder and produces a final verdict.
+Takes the output of scanner.py for both a tender and a bidder,
+compares the materials/specifications, checks company legitimacy,
+and produces a final verdict.
 
-Company legitimacy is checked against real Indian government records
-via the Sandbox.co.in API (https://developer.sandbox.co.in):
-  - GST number → verified against GST Network (live status + company name)
-  - PAN → cross-checked against the GST record
-  - Company active/cancelled status → from the same API response
+Scanner output format (from scanner.py):
+{
+  "issuing_authority": "...",
+  "opening_date":      "...",
+  "budget":            "...",
+  "materials_required": [
+    { "item": "T-Shirt", "quantity": "500", "details": "..." },
+    ...
+  ]
+}
 
-To get your Sandbox API keys:
-  1. Sign up at https://accounts.sandbox.co.in/signup (free tier available)
-  2. Go to dashboard → get x-api-key and x-api-secret
-  3. Set environment variables:
-       SANDBOX_API_KEY=your_key
-       SANDBOX_API_SECRET=your_secret
+Usage:
+  python verdict.py tender.pdf bidder.pdf
 
-When scanner.py is ready, replace the dummy data at the bottom with:
-    from scanner import scan_document
-    tender_scan = scan_document("tender.pdf")
-    bidder_scan  = scan_document("bidder.pdf")
-    print_verdict(get_verdict(tender_scan, bidder_scan))
+Or import and call directly:
+  from scanner import TenderScanner
+  from verdict import get_verdict, print_verdict
+
+  scanner = TenderScanner()
+  tender_data = scanner.extract_from_pdf("tender.pdf")
+  bidder_data  = scanner.extract_from_pdf("bidder.pdf")
+  print_verdict(get_verdict(tender_data, bidder_data, bidder_name="bidder.pdf"))
 """
 
 import re
 import os
+import sys
 import json
 import requests
 
 
-# ─────────────────────────────────────────────────────────────────
-# SANDBOX API — REAL GOVERNMENT RECORD CHECKS
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# SANDBOX API — GST VERIFICATION
+# ─────────────────────────────────────────────
 
-SANDBOX_BASE      = "https://api.sandbox.co.in"
-SANDBOX_API_KEY   = os.getenv("SANDBOX_API_KEY", "")
+SANDBOX_BASE       = "https://api.sandbox.co.in"
+SANDBOX_API_KEY    = os.getenv("SANDBOX_API_KEY", "")
 SANDBOX_API_SECRET = os.getenv("SANDBOX_API_SECRET", "")
-
-_sandbox_token = None   # cached JWT token
+_sandbox_token     = None
 
 
 def _get_sandbox_token():
-    """
-    Authenticate with Sandbox and get a JWT token.
-    Token is cached so we only call this once per run.
-    """
     global _sandbox_token
     if _sandbox_token:
         return _sandbox_token
-
     if not SANDBOX_API_KEY or not SANDBOX_API_SECRET:
-        return None     # API keys not set up
-
+        return None
     try:
         resp = requests.post(
             f"{SANDBOX_BASE}/authenticate",
@@ -62,54 +62,47 @@ def _get_sandbox_token():
             },
             timeout=10
         )
-        data = resp.json()
-        _sandbox_token = data.get("data", {}).get("access_token")
+        _sandbox_token = resp.json().get("data", {}).get("access_token")
         return _sandbox_token
     except Exception as e:
         print(f"  [Sandbox] Auth failed: {e}")
         return None
 
 
-def verify_gstin_live(gstin):
+def verify_gstin(gstin):
     """
-    Call Sandbox GST API to verify a GSTIN against real government records.
+    Verify a GSTIN against government records via Sandbox API.
+    Falls back to format-only check if API keys are not set.
 
-    Returns a dict:
-      {
-        "found":        True/False,
-        "status":       "Active" / "Cancelled" / "Not Found",
-        "company_name": "SHIV TEXTILES PVT LTD",
-        "trade_name":   "SHIV TEXTILES",
-        "company_type": "Private Limited Company",
-        "state":        "Maharashtra",
-        "reg_date":     "01/04/2018",
-        "raw":          { ...full API response... }
-      }
+    Returns dict with: found, status, company_name, company_type, state, reg_date
     """
-    # Step 1: format check before even hitting the API
-    if not gstin or not re.match(r"^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]$", gstin.upper()):
+    if not gstin:
+        return {"found": False, "status": "Missing", "detail": "No GST number found in document"}
+
+    # Format check first — always
+    pattern = r"^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]$"
+    if not re.match(pattern, gstin.strip().upper()):
         return {
-            "found":        False,
-            "status":       "Invalid format",
-            "company_name": None,
-            "detail":       f"GSTIN '{gstin}' does not match the required format"
+            "found":  False,
+            "status": "Invalid format",
+            "detail": f"'{gstin}' does not match GSTIN format (e.g. 27AAPFU0939F1ZV)"
         }
 
+    # Live API check
     token = _get_sandbox_token()
     if not token:
-        # API not configured — fall back to format-only check
         return {
-            "found":        None,       # None = unknown (not checked)
-            "status":       "Format valid (API not configured)",
+            "found":        None,
+            "status":       "Format valid",
             "company_name": None,
-            "detail":       "Set SANDBOX_API_KEY and SANDBOX_API_SECRET to enable live verification"
+            "detail":       "API keys not set — format validated only. Set SANDBOX_API_KEY to enable live check."
         }
 
     try:
         resp = requests.post(
             f"{SANDBOX_BASE}/gst/compliance/public/gstin/search",
             headers={
-                "Authorization": token,     # no "Bearer" prefix — Sandbox specific
+                "Authorization": token,
                 "x-api-key":     SANDBOX_API_KEY,
                 "Content-Type":  "application/json",
                 "x-api-version": "1.0.0"
@@ -117,258 +110,327 @@ def verify_gstin_live(gstin):
             json={"gstin": gstin.upper()},
             timeout=10
         )
-
-        resp_data = resp.json()
-        gst_data  = resp_data.get("data", {}).get("data", {})
+        gst_data = resp.json().get("data", {}).get("data", {})
 
         if not gst_data:
-            return {
-                "found":        False,
-                "status":       "Not found in GST records",
-                "company_name": None,
-                "detail":       f"GSTIN {gstin} not found in government GST database"
-            }
-
-        status       = gst_data.get("sts", "Unknown")     # "Active" or "Cancelled"
-        company_name = gst_data.get("lgnm", "")           # legal name
-        trade_name   = gst_data.get("tradeNam", "")
-        company_type = gst_data.get("ctb", "")            # e.g. "Private Limited"
-        reg_date     = gst_data.get("rgdt", "")
-        state        = gst_data.get("pradr", {}).get("addr", {}).get("stcd", "")
+            return {"found": False, "status": "Not found",
+                    "detail": f"{gstin} not found in GST database"}
 
         return {
             "found":        True,
-            "status":       status,
-            "company_name": company_name,
-            "trade_name":   trade_name,
-            "company_type": company_type,
-            "state":        state,
-            "reg_date":     reg_date,
-            "raw":          gst_data
+            "status":       gst_data.get("sts", "Unknown"),       # "Active" / "Cancelled"
+            "company_name": gst_data.get("lgnm", ""),
+            "company_type": gst_data.get("ctb", ""),
+            "state":        gst_data.get("pradr", {}).get("addr", {}).get("stcd", ""),
+            "reg_date":     gst_data.get("rgdt", ""),
         }
-
     except Exception as e:
-        return {
-            "found":        None,
-            "status":       "API error",
-            "company_name": None,
-            "detail":       f"Could not reach Sandbox API: {e}"
-        }
+        return {"found": None, "status": "API error", "detail": str(e)}
 
 
-# ─────────────────────────────────────────────────────────────────
-# THE ONE FUNCTION THAT DOES EVERYTHING
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
 
-def get_verdict(tender_scan, bidder_scan):
+def _normalize(text):
+    """Lowercase, strip punctuation/spaces — for fuzzy matching."""
+    return re.sub(r"[^a-z0-9]", "", str(text).lower())
+
+
+def _extract_numbers(text):
+    """Pull all numbers out of a string."""
+    return re.findall(r"\d+(?:\.\d+)?", str(text))
+
+
+def _items_match(tender_item, bidder_item):
     """
-    Compares a bidder's documents against tender requirements.
-    Returns a clean verdict dict with:
-      - overall_status: ELIGIBLE / NOT ELIGIBLE / FLAGGED FOR REVIEW
-      - reasons:        list of specific issues (only failures + flags, not every passing check)
-      - detail:         full breakdown for audit trail
+    Check if a bidder item name matches a tender item name.
+    Uses normalized substring matching so minor wording differences don't break it.
+    e.g. "T-Shirt Round Neck" matches "Round Neck T-Shirt Disruptive"
     """
-    tender  = tender_scan.get("fields", {})
-    bidder  = bidder_scan.get("fields", {})
-    reasons = []     # things that caused FAIL or FLAG
-    detail  = []     # full audit trail of every check
+    t = _normalize(tender_item)
+    b = _normalize(bidder_item)
+    # Check if enough words overlap (at least 50% of tender words found in bidder)
+    t_words = set(re.findall(r"[a-z0-9]{3,}", t))
+    b_words = set(re.findall(r"[a-z0-9]{3,}", b))
+    if not t_words:
+        return False
+    overlap = len(t_words & b_words) / len(t_words)
+    return overlap >= 0.5
+
+
+def _quantities_match(tender_qty, bidder_qty):
+    """
+    Compare quantities. Returns (match: bool, note: str)
+    Bidder quantity must be >= tender quantity to be eligible.
+    """
+    t_nums = _extract_numbers(tender_qty)
+    b_nums = _extract_numbers(bidder_qty)
+
+    if not t_nums or not b_nums:
+        return None, "Could not parse quantities for comparison"
+
+    t = float(t_nums[0])
+    b = float(b_nums[0])
+
+    if b >= t:
+        return True, f"Bidder offers {b_nums[0]}, required {t_nums[0]}"
+    else:
+        return False, f"Bidder offers {b_nums[0]}, required {t_nums[0]}"
+
+
+# ─────────────────────────────────────────────
+# EXTRACT GST FROM SCANNER OUTPUT
+# ─────────────────────────────────────────────
+
+def _find_gst_in_scan(scan_data):
+    """
+    Look for a GST number anywhere in the scanner output.
+    Scanner doesn't explicitly label it, so we search all string values.
+    """
+    text = json.dumps(scan_data)
+    match = re.search(r"\b\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]\b", text)
+    return match.group(0) if match else None
+
+
+def _find_pan_in_scan(scan_data):
+    """Look for a PAN number anywhere in the scanner output."""
+    text = json.dumps(scan_data)
+    match = re.search(r"\b[A-Z]{5}\d{4}[A-Z]\b", text)
+    return match.group(0) if match else None
+
+
+# ─────────────────────────────────────────────
+# MAIN VERDICT FUNCTION
+# ─────────────────────────────────────────────
+
+def get_verdict(tender_data, bidder_data, bidder_name="bidder"):
+    """
+    Compare bidder scan output against tender scan output.
+
+    Both tender_data and bidder_data are the raw dicts returned by
+    TenderScanner.extract_from_pdf() — no wrapper, no "fields" key.
+
+    Returns:
+      {
+        "bidder_id":      str,
+        "overall_status": "ELIGIBLE" | "NOT ELIGIBLE" | "FLAGGED FOR REVIEW",
+        "reasons":        [str, ...],   # only issues — what went wrong
+        "audit_detail":   [dict, ...],  # every check for audit trail
+        "company_info":   dict          # from GST API
+      }
+    """
+    reasons = []
+    detail  = []
+
+    tender_items = tender_data.get("materials_required", [])
+    bidder_items  = bidder_data.get("materials_required", [])
 
     # ── 1. DOCUMENT QUALITY ───────────────────────────────────────
-    confidence   = bidder_scan.get("confidence", 1.0)
-    needs_review = bidder_scan.get("needs_review", False)
-
-    if needs_review or confidence < 0.80:
+    # Scanner doesn't return a confidence score yet —
+    # flag if materials list is completely empty (likely bad scan)
+    if not bidder_items:
         reasons.append(
-            f"Document scan quality is low ({confidence:.0%} confidence) — "
-            f"original documents must be verified manually"
+            "No materials or specifications could be extracted from bidder document — "
+            "document may be unreadable or incorrectly formatted"
         )
-        detail.append({"check": "Document Quality", "result": "FLAG",
-                        "note": bidder_scan.get("review_reason", f"Confidence: {confidence:.0%}")})
+        detail.append({
+            "check":    "Document Readability",
+            "result":   "FLAG",
+            "required": "Readable document with specification data",
+            "found":    "No data extracted"
+        })
     else:
-        detail.append({"check": "Document Quality", "result": "PASS",
-                        "note": f"Confidence: {confidence:.0%}"})
+        detail.append({
+            "check":    "Document Readability",
+            "result":   "PASS",
+            "required": "Readable document",
+            "found":    f"{len(bidder_items)} item(s) extracted"
+        })
 
-    # ── 2. COMPANY LEGITIMACY (real API check) ────────────────────
-    bidder_compliance = bidder.get("compliance", [])
-    bidder_gst = next((i["value"] for i in bidder_compliance if i.get("type") == "GST"), None)
-    bidder_pan = next((i["value"] for i in bidder_compliance if i.get("type") == "PAN"), None)
-
-    gst_result = verify_gstin_live(bidder_gst)
+    # ── 2. COMPANY LEGITIMACY — GST check ────────────────────────
+    bidder_gst = _find_gst_in_scan(bidder_data)
+    bidder_pan = _find_pan_in_scan(bidder_data)
+    gst_result = verify_gstin(bidder_gst)
 
     if gst_result["found"] is False:
-        # Hard fail — GST either invalid format or not in government records
         reasons.append(
-            f"GST number '{bidder_gst}' is not valid — "
-            f"{gst_result.get('detail', gst_result['status'])}"
+            f"GST verification failed — {gst_result.get('detail', gst_result['status'])}"
         )
-        detail.append({"check": "GST Verification", "result": "FAIL",
-                        "gstin": bidder_gst, "note": gst_result.get("detail", gst_result["status"])})
-
+        detail.append({
+            "check":    "GST Verification",
+            "result":   "FAIL",
+            "required": "Valid active GSTIN",
+            "found":    bidder_gst or "Not found",
+            "note":     gst_result.get("detail", gst_result["status"])
+        })
     elif gst_result["found"] is True:
         if gst_result["status"] != "Active":
-            # GST exists but is cancelled/suspended
             reasons.append(
-                f"GST registration for '{gst_result['company_name']}' "
+                f"GST registration for '{gst_result.get('company_name', bidder_gst)}' "
                 f"is {gst_result['status']} — company may not be active"
             )
-            detail.append({"check": "GST Verification", "result": "FLAG",
-                            "gstin": bidder_gst, "company": gst_result["company_name"],
-                            "status": gst_result["status"]})
+            detail.append({
+                "check":    "GST Verification",
+                "result":   "FLAG",
+                "required": "Active GSTIN",
+                "found":    bidder_gst,
+                "note":     f"Status: {gst_result['status']}"
+            })
         else:
-            detail.append({"check": "GST Verification", "result": "PASS",
-                            "gstin": bidder_gst, "company": gst_result["company_name"],
-                            "type": gst_result["company_type"],
-                            "registered_since": gst_result["reg_date"]})
-
+            detail.append({
+                "check":    "GST Verification",
+                "result":   "PASS",
+                "required": "Active GSTIN",
+                "found":    bidder_gst,
+                "note":     f"{gst_result.get('company_name','')} — Active"
+            })
     else:
-        # API not configured — format check only
-        detail.append({"check": "GST Verification", "result": "INFO",
-                        "note": gst_result.get("detail")})
+        # API not configured — format was valid, note it
+        detail.append({
+            "check":    "GST Verification",
+            "result":   "PASS",
+            "required": "Valid GSTIN format",
+            "found":    bidder_gst or "Not found",
+            "note":     gst_result.get("detail", "Format validated only")
+        })
 
-    # PAN format check
+    # PAN check
     if not bidder_pan:
-        reasons.append("PAN number not found in bidder documents")
-        detail.append({"check": "PAN", "result": "FLAG", "note": "PAN not present"})
+        reasons.append("PAN number not found in bidder document")
+        detail.append({
+            "check": "PAN Number", "result": "FLAG",
+            "required": "Valid PAN", "found": "Not found"
+        })
     elif not re.match(r"^[A-Z]{5}\d{4}[A-Z]$", bidder_pan.upper()):
         reasons.append(f"PAN number '{bidder_pan}' has invalid format")
-        detail.append({"check": "PAN", "result": "FAIL", "pan": bidder_pan})
+        detail.append({
+            "check": "PAN Number", "result": "FAIL",
+            "required": "Valid PAN format", "found": bidder_pan
+        })
     else:
-        # If we got a company name from GST, check PAN prefix matches
-        # PAN 4th char encodes entity type: C=Company, F=Firm, P=Individual, etc.
-        entity_char = bidder_pan[3].upper()
-        gst_type    = gst_result.get("company_type", "")
-        detail.append({"check": "PAN", "result": "PASS", "pan": bidder_pan,
-                        "entity_type_char": entity_char})
+        detail.append({
+            "check": "PAN Number", "result": "PASS",
+            "required": "Valid PAN", "found": bidder_pan
+        })
 
-    # ── 3. CERTIFICATIONS ─────────────────────────────────────────
-    tender_certs = [i["value"] for i in tender.get("compliance", [])
-                    if i.get("type") == "certification"]
-    bidder_certs = [re.sub(r"\s+", "", i["value"]).upper()
-                    for i in bidder_compliance if i.get("type") == "certification"]
+    # ── 3. BUDGET / FINANCIAL CHECK ───────────────────────────────
+    tender_budget = tender_data.get("budget", "0")
+    bidder_budget = bidder_data.get("budget", "0")
 
-    for cert in tender_certs:
-        cert_clean = re.sub(r"\s+", "", cert).upper()
-        if cert_clean not in bidder_certs:
-            reasons.append(
-                f"Required certification '{cert}' not found in bidder documents — "
-                f"certificate must be submitted for verification"
-            )
-            detail.append({"check": f"Certification: {cert}", "result": "FLAG",
-                            "note": "Not found in submitted documents"})
-        else:
-            detail.append({"check": f"Certification: {cert}", "result": "PASS"})
+    try:
+        t_budget = float(str(tender_budget).replace(",", "")) if tender_budget != "0.00" else None
+        b_budget = float(str(bidder_budget).replace(",", "")) if bidder_budget != "0.00" else None
 
-    # ── 4. FINANCIAL REQUIREMENTS ─────────────────────────────────
-    req_turnover = tender.get("financials", {}).get("min_turnover", {})
-    bid_turnover = bidder.get("financials", {}).get("annual_turnover", {})
-    req_inr      = req_turnover.get("inr") if isinstance(req_turnover, dict) else req_turnover
-    bid_inr      = bid_turnover.get("inr") if isinstance(bid_turnover, dict) else bid_turnover
-
-    if req_inr:
-        if bid_inr is None:
-            reasons.append(
-                "Annual turnover not found in bidder's financial documents — "
-                "audited balance sheet or CA certificate must be submitted"
-            )
-            detail.append({"check": "Annual Turnover", "result": "FLAG",
-                            "required": f"Rs.{req_inr:,}", "found": "Not stated"})
-        elif bid_inr < req_inr:
-            reasons.append(
-                f"Annual turnover Rs.{bid_inr:,} is below the minimum "
-                f"requirement of Rs.{req_inr:,}"
-            )
-            detail.append({"check": "Annual Turnover", "result": "FAIL",
-                            "required": f"Rs.{req_inr:,}", "found": f"Rs.{bid_inr:,}"})
-        else:
-            detail.append({"check": "Annual Turnover", "result": "PASS",
-                            "required": f"Rs.{req_inr:,}", "found": f"Rs.{bid_inr:,}"})
-
-    req_emd = tender.get("financials", {}).get("emd", {})
-    bid_emd = bidder.get("financials", {}).get("emd_paid", {})
-    req_emd_inr = req_emd.get("inr") if isinstance(req_emd, dict) else req_emd
-    bid_emd_inr = bid_emd.get("inr") if isinstance(bid_emd, dict) else None
-
-    if req_emd_inr:
-        if not bid_emd_inr:
-            reasons.append(
-                f"EMD payment of Rs.{req_emd_inr:,} not confirmed in bidder documents"
-            )
-            detail.append({"check": "EMD Payment", "result": "FLAG",
-                            "required": f"Rs.{req_emd_inr:,}", "found": "Not confirmed"})
-        else:
-            detail.append({"check": "EMD Payment", "result": "PASS",
-                            "required": f"Rs.{req_emd_inr:,}", "found": f"Rs.{bid_emd_inr:,}"})
-
-    # ── 5. MATERIAL COMPOSITION ───────────────────────────────────
-    tender_mats  = {m["material"].lower()[:8]: m["percentage"]
-                    for m in tender.get("material_composition", [])}
-    bidder_mats  = {m["material"].lower()[:8]: m["percentage"]
-                    for m in bidder.get("material_composition", [])}
-
-    for mat_key, req_pct in tender_mats.items():
-        bid_pct = bidder_mats.get(mat_key)
-        mat_label = mat_key.title()
-        if bid_pct is None:
-            reasons.append(
-                f"Material composition for '{mat_label}' not stated — "
-                f"required {req_pct}"
-            )
-            detail.append({"check": f"Material: {mat_label}", "result": "FLAG",
-                            "required": req_pct, "found": "Not stated"})
-        elif bid_pct != req_pct:
-            reasons.append(
-                f"Material '{mat_label}' composition mismatch — "
-                f"required {req_pct}, bidder claims {bid_pct}"
-            )
-            detail.append({"check": f"Material: {mat_label}", "result": "FLAG",
-                            "required": req_pct, "found": bid_pct})
-        else:
-            detail.append({"check": f"Material: {mat_label}", "result": "PASS",
-                            "value": req_pct})
-
-    # ── 6. TECHNICAL SPECIFICATIONS ───────────────────────────────
-    tender_specs = tender.get("technical_specifications", [])
-    bidder_specs = {re.sub(r"[^a-z0-9]", "", r["parameter"].lower())[:25]: r["required_value"]
-                    for r in bidder.get("technical_specifications", [])}
-
-    spec_flags = 0
-    for row in tender_specs:
-        param     = row.get("parameter", "")
-        req_val   = row.get("required_value", "")
-        param_key = re.sub(r"[^a-z0-9]", "", param.lower())[:25]
-        bid_val   = bidder_specs.get(param_key)
-
-        if bid_val is None:
-            spec_flags += 1
-            detail.append({"check": f"Spec: {param[:45]}", "result": "FLAG",
-                            "required": req_val, "found": "Not stated by bidder"})
-        else:
-            t_nums = re.findall(r"\d+(?:\.\d+)?", req_val)
-            b_nums = re.findall(r"\d+(?:\.\d+)?", bid_val)
-            match  = (float(t_nums[0]) == float(b_nums[0])) if (t_nums and b_nums) else \
-                     (param_key == re.sub(r"[^a-z0-9]", "", bid_val.lower())[:25])
-
-            if not match:
-                reasons.append(
-                    f"Spec '{param[:40]}' — required: {req_val}, bidder offers: {bid_val}"
-                )
-                detail.append({"check": f"Spec: {param[:45]}", "result": "FLAG",
-                                "required": req_val, "found": bid_val})
+        if t_budget and b_budget:
+            if b_budget >= t_budget:
+                detail.append({
+                    "check":    "Budget / Financials",
+                    "result":   "PASS",
+                    "required": f"{tender_budget}",
+                    "found":    f"{bidder_budget}"
+                })
             else:
-                detail.append({"check": f"Spec: {param[:45]}", "result": "PASS",
-                                "value": req_val})
+                reasons.append(
+                    f"Bidder financials ({bidder_budget}) are below the tender value ({tender_budget})"
+                )
+                detail.append({
+                    "check":    "Budget / Financials",
+                    "result":   "FAIL",
+                    "required": f"{tender_budget}",
+                    "found":    f"{bidder_budget}"
+                })
+        else:
+            detail.append({
+                "check":  "Budget / Financials",
+                "result": "FLAG",
+                "required": str(tender_budget),
+                "found":    str(bidder_budget) if bidder_budget else "Not stated",
+                "note":   "Could not compare — value missing or unparseable"
+            })
+    except Exception:
+        detail.append({
+            "check": "Budget / Financials", "result": "FLAG",
+            "note":  "Could not parse budget values"
+        })
 
-    if spec_flags > 0:
-        reasons.append(
-            f"{spec_flags} technical specification(s) not addressed in bidder documents"
-        )
+    # ── 4. MATERIALS / SPECIFICATIONS — the core comparison ───────
+    if not tender_items:
+        detail.append({
+            "check":  "Materials Comparison",
+            "result": "FLAG",
+            "note":   "No materials extracted from tender — cannot compare"
+        })
+    else:
+        unmatched_count = 0
+
+        for t_item in tender_items:
+            t_name = t_item.get("item", "")
+            t_qty  = t_item.get("quantity", "")
+            t_det  = t_item.get("details", "")
+
+            if not t_name:
+                continue
+
+            # Find matching item in bidder's list
+            matched_bidder_item = next(
+                (b for b in bidder_items if _items_match(t_name, b.get("item", ""))),
+                None
+            )
+
+            if matched_bidder_item is None:
+                unmatched_count += 1
+                detail.append({
+                    "check":    f"Item: {t_name[:50]}",
+                    "result":   "FLAG",
+                    "required": f"qty: {t_qty} | {t_det}",
+                    "found":    "Not found in bidder document"
+                })
+            else:
+                b_qty  = matched_bidder_item.get("quantity", "")
+                b_det  = matched_bidder_item.get("details", "")
+                b_name = matched_bidder_item.get("item", "")
+
+                # Compare quantities
+                qty_match, qty_note = _quantities_match(t_qty, b_qty)
+
+                if qty_match is False:
+                    reasons.append(
+                        f"Item '{t_name[:40]}' — quantity mismatch: {qty_note}"
+                    )
+                    detail.append({
+                        "check":    f"Item: {t_name[:50]}",
+                        "result":   "FAIL",
+                        "required": f"qty: {t_qty}",
+                        "found":    f"qty: {b_qty}",
+                        "note":     qty_note
+                    })
+                elif qty_match is None:
+                    detail.append({
+                        "check":    f"Item: {t_name[:50]}",
+                        "result":   "FLAG",
+                        "required": f"qty: {t_qty} | {t_det}",
+                        "found":    f"qty: {b_qty} | {b_det}",
+                        "note":     qty_note
+                    })
+                else:
+                    detail.append({
+                        "check":    f"Item: {t_name[:50]}",
+                        "result":   "PASS",
+                        "required": f"qty: {t_qty}",
+                        "found":    f"qty: {b_qty}",
+                        "note":     qty_note
+                    })
+
+        if unmatched_count > 0:
+            reasons.append(
+                f"{unmatched_count} item(s) required by the tender were not found "
+                f"in the bidder's submission"
+            )
 
     # ── FINAL VERDICT ─────────────────────────────────────────────
-    # FAIL conditions — hard disqualifiers
-    hard_fails = [
-        r for r in reasons if any(k in r.lower() for k in
-        ["not valid", "invalid format", "below the minimum", "insufficient"])
-    ]
+    hard_fails = [r for r in reasons if any(k in r.lower() for k in
+                  ["failed", "invalid", "below", "mismatch", "not found in bidder"])]
 
     if hard_fails:
         overall = "NOT ELIGIBLE"
@@ -378,11 +440,11 @@ def get_verdict(tender_scan, bidder_scan):
         overall = "ELIGIBLE"
 
     return {
-        "bidder_id":      bidder_scan.get("document_id", "unknown"),
+        "bidder_id":      bidder_name,
         "overall_status": overall,
-        "reasons":        reasons,        # only failures + flags — clean for officer
-        "audit_detail":   detail,         # full check-by-check trail
-        "company_info":   {               # pulled from live GST API
+        "reasons":        reasons,
+        "audit_detail":   detail,
+        "company_info": {
             "name":       gst_result.get("company_name"),
             "type":       gst_result.get("company_type"),
             "gst_status": gst_result.get("status"),
@@ -392,9 +454,9 @@ def get_verdict(tender_scan, bidder_scan):
     }
 
 
-# ─────────────────────────────────────────────────────────────────
-# PRINT — clean output for procurement officer
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# PRINT
+# ─────────────────────────────────────────────
 
 def print_verdict(verdict):
     symbol = {"ELIGIBLE": "✓", "NOT ELIGIBLE": "✗", "FLAGGED FOR REVIEW": "⚠"}.get(
@@ -406,112 +468,82 @@ def print_verdict(verdict):
     info = verdict.get("company_info", {})
     if info.get("name"):
         print(f"  COMPANY : {info['name']} ({info.get('type','')})")
-        print(f"  GST     : {info.get('gst_status','')} | Reg: {info.get('reg_date','')} | {info.get('state','')}")
+        print(f"  GST     : {info.get('gst_status','')} | {info.get('state','')} | Reg: {info.get('reg_date','')}")
 
     print(f"  VERDICT : {symbol}  {verdict['overall_status']}")
     print(f"{'═'*55}")
 
-    if verdict["overall_status"] == "ELIGIBLE":
+    if not verdict["reasons"]:
         print("  All checks passed. Bidder is eligible.")
     else:
         print(f"  ISSUES ({len(verdict['reasons'])}):")
-        for i, reason in enumerate(verdict["reasons"], 1):
-            print(f"  {i}. {reason}")
-
+        for i, r in enumerate(verdict["reasons"], 1):
+            print(f"  {i}. {r}")
     print()
 
 
-# ─────────────────────────────────────────────────────────────────
-# DUMMY DATA — same format scanner.py outputs
-# Replace with: from scanner import scan_document
-# ─────────────────────────────────────────────────────────────────
-
-DUMMY_TENDER = {
-    "document_id": "tender_crpf_tshirt",
-    "confidence":  0.99,
-    "needs_review": False,
-    "fields": {
-        "financials": {
-            "min_turnover": {"raw": "5 Crore", "inr": 50_000_000},
-            "emd":          {"raw": "50000",   "inr": 50_000}
-        },
-        "compliance": [
-            {"type": "certification", "value": "ISO 9001"},
-            {"type": "certification", "value": "ISO 18184"},
-        ],
-        "material_composition": [
-            {"percentage": "92%", "material": "Performance Polyester"},
-            {"percentage": "8%",  "material": "Lycra"},
-        ],
-        "technical_specifications": [
-            {"s_no": "3",  "parameter": "Seam Strength Wales wise", "required_value": "250"},
-            {"s_no": "5",  "parameter": "Fabric Weight",            "required_value": "180"},
-            {"s_no": "13", "parameter": "pH value",                 "required_value": "7"},
-        ]
-    }
-}
-
-# Bidder A — mostly good, missing one cert
-DUMMY_BIDDER_A = {
-    "document_id": "bidder_A_ShivTextiles",
-    "confidence":  0.96,
-    "needs_review": False,
-    "fields": {
-        "financials": {
-            "annual_turnover": {"raw": "6.5 Crore", "inr": 65_000_000},
-            "emd_paid":        {"raw": "50000",     "inr": 50_000}
-        },
-        "compliance": [
-            {"type": "GST",           "value": "27AAPFU0939F1ZV"},
-            {"type": "PAN",           "value": "AAPFU0939F"},
-            {"type": "certification", "value": "ISO 9001"},
-            # ISO 18184 missing — will be flagged
-        ],
-        "material_composition": [
-            {"percentage": "92%", "material": "Performance Polyester"},
-            {"percentage": "8%",  "material": "Lycra"},
-        ],
-        "technical_specifications": [
-            {"s_no": "3",  "parameter": "Seam Strength Wales wise", "required_value": "250"},
-            {"s_no": "5",  "parameter": "Fabric Weight",            "required_value": "180"},
-            {"s_no": "13", "parameter": "pH value",                 "required_value": "7"},
-        ]
-    }
-}
-
-# Bidder B — multiple hard fails
-DUMMY_BIDDER_B = {
-    "document_id": "bidder_B_RajGarments",
-    "confidence":  0.61,
-    "needs_review": True,
-    "review_reason": "Low OCR confidence (61%) — verify originals",
-    "fields": {
-        "financials": {
-            "annual_turnover": {"raw": "3 Crore", "inr": 30_000_000},  # below minimum
-            "emd_paid":        None
-        },
-        "compliance": [
-            {"type": "GST", "value": "BADINVALIDGST00"},  # invalid format
-            {"type": "PAN", "value": "AAPFU0939F"},
-        ],
-        "material_composition": [],
-        "technical_specifications": []
-    }
-}
-
-
-# ─────────────────────────────────────────────────────────────────
-# RUN
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# RUN — python verdict.py tender.pdf bidder.pdf
+# ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Comment these two lines out and use scanner.scan_document() when ready:
-    # from scanner import scan_document
-    # tender_scan = scan_document("tender.pdf")
+    if len(sys.argv) < 3:
+        print("Usage: python verdict.py <tender.pdf> <bidder.pdf>")
+        print("\nRunning with dummy data instead...\n")
 
-    print("\n" + "─"*55)
-    print("  CRPF TENDER EVALUATION — VERDICT ENGINE")
-    print("─"*55)
+        # Dummy data matching scanner.py output format exactly
+        DUMMY_TENDER = {
+            "issuing_authority": "CRPF HQ New Delhi",
+            "opening_date":      "15/05/2026",
+            "budget":            "4200000",
+            "materials_required": [
+                {"item": "T-Shirt Half Sleeves Round Neck Disruptive Pattern", "quantity": "500",  "details": "92% Polyester 8% Lycra"},
+                {"item": "Packaging Polybag Transparent",                       "quantity": "500",  "details": "35cm x 27cm"},
+                {"item": "Cardboard Box Recycled",                              "quantity": "100",  "details": "300 gsm 26cm x 22cm"},
+            ]
+        }
 
-    print_verdict(get_verdict(DUMMY_TENDER, DUMMY_BIDDER_A))
-    print_verdict(get_verdict(DUMMY_TENDER, DUMMY_BIDDER_B))
+        DUMMY_BIDDER_GOOD = {
+            "issuing_authority": "N/A",
+            "opening_date":      "N/A",
+            "budget":            "5000000",
+            "materials_required": [
+                {"item": "T-Shirt Round Neck Disruptive Half Sleeve",  "quantity": "500",  "details": "92% Polyester 8% Lycra GSTIN:27AAPFU0939F1ZV PAN:AAPFU0939F"},
+                {"item": "Transparent Polybag Packaging",              "quantity": "500",  "details": "35cm x 27cm"},
+                {"item": "Recycled Cardboard Box",                     "quantity": "100",  "details": "300gsm"},
+            ]
+        }
+
+        DUMMY_BIDDER_BAD = {
+            "issuing_authority": "N/A",
+            "opening_date":      "N/A",
+            "budget":            "3000000",
+            "materials_required": [
+                {"item": "T-Shirt Round Neck",  "quantity": "300",  "details": "80% Polyester GSTIN:BADINVALID123"},
+                # Missing other items
+            ]
+        }
+
+        print("─"*55)
+        print("  CRPF TENDER EVALUATION — VERDICT ENGINE")
+        print("─"*55)
+        print_verdict(get_verdict(DUMMY_TENDER, DUMMY_BIDDER_GOOD, "GoodBidder_Co"))
+        print_verdict(get_verdict(DUMMY_TENDER, DUMMY_BIDDER_BAD,  "BadBidder_Co"))
+
+    else:
+        # Real usage — scan both files and compare
+        from scanner import TenderScanner
+
+        scanner     = TenderScanner()
+        tender_data = scanner.extract_from_pdf(sys.argv[1])
+        bidder_data  = scanner.extract_from_pdf(sys.argv[2])
+
+        print(f"\nTender  : {sys.argv[1]}")
+        print(f"Bidder  : {sys.argv[2]}\n")
+
+        verdict = get_verdict(tender_data, bidder_data, bidder_name=sys.argv[2])
+        print_verdict(verdict)
+
+        # Full JSON output for audit
+        print("\n── FULL AUDIT DETAIL " + "─"*35)
+        print(json.dumps(verdict["audit_detail"], indent=2))
