@@ -1,16 +1,3 @@
-"""
-main.py — CRPF Tender Evaluation Server
-=========================================
-Ties scanner.py + verdict.py together and serves the frontend.
-
-Install:
-    pip install fastapi uvicorn python-multipart
-
-Run:
-    python main.py
-
-Then open: http://localhost:8000
-"""
 
 import os
 import sys

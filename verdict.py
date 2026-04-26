@@ -1,33 +1,3 @@
-"""
-verdict.py — CRPF Tender Evaluation
-=====================================
-Takes the output of scanner.py for both a tender and a bidder,
-compares the materials/specifications, checks company legitimacy,
-and produces a final verdict.
-
-Scanner output format (from scanner.py):
-{
-  "issuing_authority": "...",
-  "opening_date":      "...",
-  "budget":            "...",
-  "materials_required": [
-    { "item": "T-Shirt", "quantity": "500", "details": "..." },
-    ...
-  ]
-}
-
-Usage:
-  python verdict.py tender.pdf bidder.pdf
-
-Or import and call directly:
-  from scanner import TenderScanner
-  from verdict import get_verdict, print_verdict
-
-  scanner = TenderScanner()
-  tender_data = scanner.extract_from_pdf("tender.pdf")
-  bidder_data  = scanner.extract_from_pdf("bidder.pdf")
-  print_verdict(get_verdict(tender_data, bidder_data, bidder_name="bidder.pdf"))
-"""
 
 import re
 import os

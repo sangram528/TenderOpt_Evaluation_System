@@ -141,7 +141,6 @@ async function runEvaluation() {
       [10, "Uploading documents…"],
       [25, "Parsing tender document…"],
       [45, "Scanning bidder submissions…"],
-      [65, "Verifying GST against government records…"],
       [80, "Comparing specifications…"],
       [90, "Generating report…"],
     ];
@@ -375,9 +374,6 @@ function renderAuditLog(bidders) {
 }
 
 
-// ─────────────────────────────────────────────
-// TAB SWITCHING
-// ─────────────────────────────────────────────
 
 function switchTab(name) {
   const names = ["overview", "detail", "audit"];
@@ -396,71 +392,3 @@ function switchTab(name) {
 }
 
 
-// ─────────────────────────────────────────────
-// DUMMY RESULTS
-// Replace simulateEvaluation() with a real fetch() when backend is ready
-// ─────────────────────────────────────────────
-
-const DUMMY_RESULTS = {
-  tender: {
-    title:          "T-Shirt Half Sleeves Round Neck Disruptive Pattern",
-    authority:      "CRPF HQ, New Delhi",
-    criteria_count: 14,
-    bidder_count:   2,
-    estimated_cost: "₹42,00,000",
-  },
-  bidders: [
-    {
-      bidder_id:      "bidder_A_ShivTextiles",
-      overall_status: "FLAGGED FOR REVIEW",
-      reasons: [
-        "Required certification 'ISO 18184' not found in submitted documents",
-      ],
-      company_info: { name: "SHIV TEXTILES PVT LTD", type: "Private Limited" },
-      audit_detail: [
-        { check: "Document Quality",               result: "PASS", required: "Clear readable scan", found: "Confidence: 96%" },
-        { check: "GST Verification",               result: "PASS", required: "Valid active GSTIN",  found: "27AAPFU0939F1ZV", note: "Active" },
-        { check: "PAN Number",                     result: "PASS", required: "Valid PAN",            found: "AAPFU0939F" },
-        { check: "Certification: ISO 9001",        result: "PASS", required: "ISO 9001",             found: "Present" },
-        { check: "Certification: ISO 18184",       result: "FLAG", required: "ISO 18184",            found: "Not found", note: "Certificate must be submitted" },
-        { check: "Annual Turnover",                result: "PASS", required: "Rs.5,00,00,000",       found: "Rs.6,50,00,000" },
-        { check: "EMD Payment",                    result: "PASS", required: "Rs.50,000",            found: "Rs.50,000" },
-        { check: "Material: Performance Polyester",result: "PASS", required: "92%",                  found: "92%" },
-        { check: "Material: Lycra",                result: "PASS", required: "8%",                   found: "8%" },
-        { check: "Spec: Seam Strength",            result: "PASS", required: "250 N(Min)",           found: "250 N" },
-        { check: "Spec: Fabric Weight",            result: "PASS", required: "180±5%",               found: "180" },
-        { check: "Spec: pH Value",                 result: "PASS", required: "6.0–8.5",              found: "7.0" },
-        { check: "Spec: Bursting Strength",        result: "PASS", required: "100±10",               found: "102" },
-        { check: "Spec: Colour Fastness",          result: "PASS", required: "4 or better",          found: "4" },
-      ]
-    },
-    {
-      bidder_id:      "bidder_B_RajGarments",
-      overall_status: "NOT ELIGIBLE",
-      reasons: [
-        "Document scan quality low (61%) — originals must be verified manually",
-        "GST number 'BADINVALIDGST00' does not match required format",
-        "Annual turnover Rs.30,000,000 is below minimum Rs.50,000,000",
-        "EMD payment not confirmed in submitted documents",
-        "Material composition not stated in bidder documents",
-        "4 technical specifications not addressed",
-      ],
-      company_info: { name: "RAJ GARMENTS", type: "Partnership" },
-      audit_detail: [
-        { check: "Document Quality",         result: "FLAG", required: "Clear readable scan", found: "Confidence: 61%",  note: "Low OCR confidence — verify originals" },
-        { check: "GST Verification",         result: "FAIL", required: "Valid active GSTIN",  found: "BADINVALIDGST00",  note: "Does not match GSTIN format" },
-        { check: "PAN Number",               result: "PASS", required: "Valid PAN",            found: "AAPFU0939F" },
-        { check: "Certification: ISO 9001",  result: "FLAG", required: "ISO 9001",             found: "Not found" },
-        { check: "Certification: ISO 18184", result: "FLAG", required: "ISO 18184",            found: "Not found" },
-        { check: "Annual Turnover",          result: "FAIL", required: "Rs.5,00,00,000",       found: "Rs.3,00,00,000" },
-        { check: "EMD Payment",              result: "FLAG", required: "Rs.50,000",            found: "Not confirmed" },
-        { check: "Material: Polyester",      result: "FLAG", required: "92%",                  found: "Not stated" },
-        { check: "Material: Lycra",          result: "FLAG", required: "8%",                   found: "Not stated" },
-        { check: "Spec: Seam Strength",      result: "FLAG", required: "250 N(Min)",           found: "Not stated" },
-        { check: "Spec: Fabric Weight",      result: "FLAG", required: "180±5%",               found: "Not stated" },
-        { check: "Spec: pH Value",           result: "FLAG", required: "6.0–8.5",              found: "Not stated" },
-        { check: "Spec: Bursting Strength",  result: "FLAG", required: "100±10",               found: "Not stated" },
-      ]
-    }
-  ]
-};
