@@ -3,10 +3,12 @@ services:
     name: tenderopt-evaluation-system
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      apt-get install -y tesseract-ocr tesseract-ocr-eng libtesseract-dev &&
+      pip install -r requirements.txt
     startCommand: gunicorn "main:create_app()"
     envVars:
       - key: GROQ_API_KEY
         sync: false
-    packages:
-      - tesseract-ocr
+      - key: TESSDATA_PREFIX
+        value: /usr/share/tesseract-ocr/4.00/tessdata
