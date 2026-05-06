@@ -23,7 +23,7 @@ document.getElementById('themeToggle').addEventListener('click', () => {
 
 // ── STATE ───────────────────────────────────────────────────────
 let tenderFile  = null;
-let bidderFiles = [];   // array — multiple bidders
+let bidderFiles = [];
 
 
 // ── TENDER ZONE (single file) ────────────────────────────────────
@@ -72,7 +72,7 @@ let bidderFiles = [];   // array — multiple bidders
   });
   input.addEventListener('change', () => {
     addBidderFiles(Array.from(input.files));
-    input.value = ''; // reset so same file can be re-added if needed
+    input.value = '';
   });
 
   function addBidderFiles(files) {
@@ -89,7 +89,15 @@ let bidderFiles = [];   // array — multiple bidders
     bidderFiles.forEach((f, i) => {
       const li = document.createElement('li');
       li.innerHTML = `<span>${esc(f.name)}</span>
-        <button class="remove-file" data-i="${i}" title="Remove"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg></button>`;
+        <button class="remove-file" data-i="${i}" title="Remove">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6l-1 14H6L5 6"/>
+            <path d="M10 11v6"/><path d="M14 11v6"/>
+            <path d="M9 6V4h6v2"/>
+          </svg>
+        </button>`;
       listEl.appendChild(li);
     });
     listEl.querySelectorAll('.remove-file').forEach(btn => {
@@ -139,10 +147,9 @@ function setStage(pct, msg, active) {
   if (active >= 3) ps3.classList.add(active > 3 ? 'done' : 'active');
 }
 
-// Per-bidder progress update
 function setStageForBidder(current, total) {
-  const pct = Math.round(10 + (current / total) * 75);
-  setStage(pct, `Scanning bidder ${current} of ${total}…`, 2);
+  const pct = Math.round(30 + (current / total) * 60);
+  setStage(pct, `Comparing bidder ${current} of ${total}…`, 2);
 }
 
 
@@ -157,37 +164,73 @@ document.getElementById('analyseBtn').addEventListener('click', async () => {
     return;
   }
 
-  // Reset reports
+  // Reset reports section
   document.getElementById('reportsSection').classList.remove('visible');
   document.getElementById('reportsList').innerHTML = '';
 
   showOverlay();
-  setStage(5, 'Starting analysis…', 1);
 
+  // ── Step 1: Scan tender document ONCE ────────────────────────
+  setStage(10, 'Scanning tender document…', 1);
+
+  let sessionId = null;
+  try {
+    const tenderForm = new FormData();
+    tenderForm.append('tender', tenderFile);
+
+    const res = await fetch('/scan-tender', { method: 'POST', body: tenderForm });
+    const data = await res.json();
+
+    if (!res.ok) {
+      hideOverlay();
+      alert('Failed to scan tender:\n' + (data.error || `Server error ${res.status}`));
+      return;
+    }
+
+    sessionId = data.session_id;
+  } catch (err) {
+    hideOverlay();
+    alert('Network error while scanning tender:\n' + (err.message || 'Unknown error'));
+    return;
+  }
+
+  setStage(25, 'Tender scanned. Starting bidder comparisons…', 2);
+
+  // ── Step 2: Compare each bidder using the cached tender ───────
+  // Tender is NOT re-scanned for each bidder — zero extra tokens wasted.
   const reports = [];
 
   for (let i = 0; i < bidderFiles.length; i++) {
     setStageForBidder(i + 1, bidderFiles.length);
 
     const formData = new FormData();
-    formData.append('tender', tenderFile);
+    formData.append('session_id', sessionId);
     formData.append('bidder', bidderFiles[i]);
 
     try {
-      const response = await fetch('/compare', { method: 'POST', body: formData });
+      const response = await fetch('/compare-bidder', { method: 'POST', body: formData });
 
       if (!response.ok) {
-        const err = await response.json().catch(() => ({ error: `Server error ${response.status}` }));
-        reports.push({ filename: bidderFiles[i].name, error: err.error || `Server error ${response.status}` });
+        const err = await response.json().catch(() => ({
+          error: `Server error ${response.status}`
+        }));
+        reports.push({
+          filename: bidderFiles[i].name,
+          error: err.error || `Server error ${response.status}`
+        });
       } else {
         const report = await response.json();
         reports.push({ filename: bidderFiles[i].name, ...report });
       }
     } catch (err) {
-      reports.push({ filename: bidderFiles[i].name, error: err.message || 'Network error.' });
+      reports.push({
+        filename: bidderFiles[i].name,
+        error: err.message || 'Network error — check your connection.'
+      });
     }
   }
 
+  // ── Step 3: Done ─────────────────────────────────────────────
   setStage(100, 'Analysis complete.', 4);
 
   setTimeout(() => {
@@ -202,7 +245,7 @@ function renderReports(reports) {
   const list = document.getElementById('reportsList');
   list.innerHTML = '';
 
-  reports.forEach((r, idx) => {
+  reports.forEach((r) => {
     const card = document.createElement('div');
 
     if (r.error) {
@@ -226,7 +269,7 @@ function renderReports(reports) {
       card.innerHTML = `
         <div class="report-card-header" onclick="toggleCard(this)">
           <span class="report-filename">${esc(r.filename)}</span>
-          <span class="report-verdict-badge ${cls}">${r.verdict}</span>
+          <span class="report-verdict-badge ${cls}">${esc(r.verdict)}</span>
           <span class="report-toggle-icon">▼</span>
         </div>
         <div class="report-card-body">
@@ -244,12 +287,14 @@ function renderReports(reports) {
   });
 
   document.getElementById('reportsSection').classList.add('visible');
-  document.getElementById('reportsSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  document.getElementById('reportsSection').scrollIntoView({
+    behavior: 'smooth',
+    block: 'start'
+  });
 }
 
 function toggleCard(header) {
-  const card = header.closest('.report-card');
-  card.classList.toggle('open');
+  header.closest('.report-card').classList.toggle('open');
 }
 
 function makeItem(entry) {
@@ -293,5 +338,7 @@ document.getElementById('resetBtn').addEventListener('click', () => {
 // ── HELPERS ──────────────────────────────────────────────────────
 function esc(str) {
   return String(str ?? '—')
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;');
 }
