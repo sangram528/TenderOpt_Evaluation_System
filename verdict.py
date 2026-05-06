@@ -1,519 +1,415 @@
+"""
+verdict.py — Tender vs Bidder Comparison Engine
+================================================
+Takes two scanner.py output dicts (tender + bidder) and returns a verdict.
 
-import re
+Verdict:
+  PASSED   — all fields match within acceptable tolerance
+  FLAGGED  — one or more mismatches found; conflicting points listed
+
+Comparison strategy:
+  • CRITICAL fields  (emd_amount, estimated_cost/budget, submission_deadline,
+                      delivery_period, eligibility, key_performance_specs,
+                      materials_required, quantity)
+      → Any mismatch here = FLAGGED, regardless of severity.
+
+  • INFORMATIONAL fields (everything else)
+      → Mismatch noted in the report but does not change PASSED to FLAGGED.
+
+  Numeric / amount fields  → Python normalisation (strips ₹, Rs., commas,
+                              lakhs/crores expansion) then numeric comparison.
+  Date fields              → Python parsing across common Indian date formats.
+  Text / list fields       → LLM semantic judge via Groq (single batched call).
+"""
+
 import os
-import sys
+import re
 import json
-import requests
+from datetime import datetime
+from difflib import SequenceMatcher
 
+from groq import Groq
+from dotenv import load_dotenv
 
-# ─────────────────────────────────────────────
-# SANDBOX API — GST VERIFICATION
-# ─────────────────────────────────────────────
+load_dotenv()
 
-SANDBOX_BASE       = "https://api.sandbox.co.in"
-SANDBOX_API_KEY    = os.getenv("SANDBOX_API_KEY", "")
-SANDBOX_API_SECRET = os.getenv("SANDBOX_API_SECRET", "")
-_sandbox_token     = None
+# ─────────────────────────────────────────────────────────────────────────────
+# Field classification
+# ─────────────────────────────────────────────────────────────────────────────
 
+CRITICAL_FIELDS = {
+    "emd_amount",
+    "estimated_cost",
+    "budget",
+    "submission_deadline",
+    "delivery_period",
+    "quantity",
+    "eligibility",
+    "key_performance_specs",
+    "materials_required",
+}
 
-def _get_sandbox_token():
-    global _sandbox_token
-    if _sandbox_token:
-        return _sandbox_token
-    if not SANDBOX_API_KEY or not SANDBOX_API_SECRET:
+NUMERIC_FIELDS = {
+    "emd_amount",
+    "estimated_cost",
+    "budget",
+    "quantity",
+    "fabric_weight",
+}
+
+DATE_FIELDS = {
+    "submission_deadline",
+    "opening_date",
+    "date_of_issue",
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Numeric normalisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+_LAKH  = 1_00_000
+_CRORE = 1_00_00_000
+
+def _parse_amount(value: str) -> float | None:
+    """
+    Convert messy Indian-currency strings to a plain float.
+    Handles: ₹, Rs., commas, lakh/lakhs, crore/crores, L, Cr.
+
+    Returns None if the string cannot be parsed.
+    """
+    if not value:
         return None
+
+    s = str(value).lower().strip()
+    s = s.replace(",", "").replace("₹", "").replace("rs.", "").replace("rs", "")
+    s = s.strip()
+
+    # Detect unit multiplier words before stripping them
+    multiplier = 1
+    if re.search(r"crore|cr\b", s):
+        multiplier = _CRORE
+    elif re.search(r"lakh|lac\b|l\b", s):
+        multiplier = _LAKH
+
+    # Pull out the leading number
+    m = re.search(r"[\d]+(?:\.\d+)?", s)
+    if not m:
+        return None
+
     try:
-        resp = requests.post(
-            f"{SANDBOX_BASE}/authenticate",
-            headers={
-                "x-api-key":    SANDBOX_API_KEY,
-                "x-api-secret": SANDBOX_API_SECRET,
-                "Content-Type": "application/json"
-            },
-            timeout=10
-        )
-        _sandbox_token = resp.json().get("data", {}).get("access_token")
-        return _sandbox_token
-    except Exception as e:
-        print(f"  [Sandbox] Auth failed: {e}")
+        return float(m.group()) * multiplier
+    except ValueError:
         return None
 
 
-def verify_gstin(gstin):
+def _amounts_match(a: str, b: str, tolerance: float = 0.01) -> bool:
     """
-    Verify a GSTIN against government records via Sandbox API.
-    Falls back to format-only check if API keys are not set.
-
-    Returns dict with: found, status, company_name, company_type, state, reg_date
+    True if two amount strings refer to the same number within `tolerance`
+    fractional difference (default 1 %).
     """
-    if not gstin:
-        return {"found": False, "status": "Missing", "detail": "No GST number found in document"}
-
-    # Format check first — always
-    pattern = r"^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]$"
-    if not re.match(pattern, gstin.strip().upper()):
-        return {
-            "found":  False,
-            "status": "Invalid format",
-            "detail": f"'{gstin}' does not match GSTIN format (e.g. 27AAPFU0939F1ZV)"
-        }
-
-    # Live API check
-    token = _get_sandbox_token()
-    if not token:
-        return {
-            "found":        None,
-            "status":       "Format valid",
-            "company_name": None,
-            "detail":       "API keys not set — format validated only. Set SANDBOX_API_KEY to enable live check."
-        }
-
-    try:
-        resp = requests.post(
-            f"{SANDBOX_BASE}/gst/compliance/public/gstin/search",
-            headers={
-                "Authorization": token,
-                "x-api-key":     SANDBOX_API_KEY,
-                "Content-Type":  "application/json",
-                "x-api-version": "1.0.0"
-            },
-            json={"gstin": gstin.upper()},
-            timeout=10
-        )
-        gst_data = resp.json().get("data", {}).get("data", {})
-
-        if not gst_data:
-            return {"found": False, "status": "Not found",
-                    "detail": f"{gstin} not found in GST database"}
-
-        return {
-            "found":        True,
-            "status":       gst_data.get("sts", "Unknown"),       # "Active" / "Cancelled"
-            "company_name": gst_data.get("lgnm", ""),
-            "company_type": gst_data.get("ctb", ""),
-            "state":        gst_data.get("pradr", {}).get("addr", {}).get("stcd", ""),
-            "reg_date":     gst_data.get("rgdt", ""),
-        }
-    except Exception as e:
-        return {"found": None, "status": "API error", "detail": str(e)}
-
-
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
-
-def _normalize(text):
-    """Lowercase, strip punctuation/spaces — for fuzzy matching."""
-    return re.sub(r"[^a-z0-9]", "", str(text).lower())
-
-
-def _extract_numbers(text):
-    """Pull all numbers out of a string."""
-    return re.findall(r"\d+(?:\.\d+)?", str(text))
-
-
-def _items_match(tender_item, bidder_item):
-    """
-    Check if a bidder item name matches a tender item name.
-    Uses normalized substring matching so minor wording differences don't break it.
-    e.g. "T-Shirt Round Neck" matches "Round Neck T-Shirt Disruptive"
-    """
-    t = _normalize(tender_item)
-    b = _normalize(bidder_item)
-    # Check if enough words overlap (at least 50% of tender words found in bidder)
-    t_words = set(re.findall(r"[a-z0-9]{3,}", t))
-    b_words = set(re.findall(r"[a-z0-9]{3,}", b))
-    if not t_words:
+    na, nb = _parse_amount(a), _parse_amount(b)
+    if na is None or nb is None:
+        # Fall back to string similarity if parsing fails
+        return SequenceMatcher(None, str(a).lower(), str(b).lower()).ratio() > 0.85
+    if na == 0 and nb == 0:
+        return True
+    if na == 0 or nb == 0:
         return False
-    overlap = len(t_words & b_words) / len(t_words)
-    return overlap >= 0.5
+    return abs(na - nb) / max(abs(na), abs(nb)) <= tolerance
 
 
-def _quantities_match(tender_qty, bidder_qty):
+# ─────────────────────────────────────────────────────────────────────────────
+# Date normalisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DATE_FORMATS = [
+    "%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y",
+    "%d-%b-%Y", "%d %b %Y", "%d %B %Y",
+    "%B %d, %Y", "%b %d, %Y",
+    "%Y-%m-%d",
+]
+
+def _parse_date(value: str) -> datetime | None:
+    if not value:
+        return None
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(str(value).strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _dates_match(a: str, b: str) -> bool:
+    da, db = _parse_date(a), _parse_date(b)
+    if da and db:
+        return da.date() == db.date()
+    # Fall back to string fuzzy if parsing fails
+    return SequenceMatcher(None, str(a).lower(), str(b).lower()).ratio() > 0.85
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM semantic comparison (single batched call for all text fields)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _llm_compare_fields(pairs: list[dict], client: Groq) -> list[dict]:
     """
-    Compare quantities. Returns (match: bool, note: str)
-    Bidder quantity must be >= tender quantity to be eligible.
+    Send a batch of field-pairs to the LLM and get back a match/mismatch
+    verdict with a brief reason for each.
+
+    pairs: [{"field": "work_name", "tender": "...", "bidder": "..."}, ...]
+
+    Returns the same list with "match" (bool) and "reason" (str) added.
     """
-    t_nums = _extract_numbers(tender_qty)
-    b_nums = _extract_numbers(bidder_qty)
+    if not pairs:
+        return []
 
-    if not t_nums or not b_nums:
-        return None, "Could not parse quantities for comparison"
+    system_msg = (
+        "You are a tender compliance auditor. You will receive a JSON array of "
+        "field comparisons between a government tender document and a bidder's "
+        "response document. For each entry decide whether the bidder's value "
+        "semantically matches the tender's value — allow for paraphrasing, "
+        "abbreviations, and minor formatting differences, but flag genuine "
+        "discrepancies in meaning, scope, or requirement.\n\n"
+        "Return ONLY a JSON array (same order, same length) where each element "
+        "has exactly two keys:\n"
+        '  "match": true or false\n'
+        '  "reason": one concise sentence explaining the decision\n'
+        "No markdown, no extra keys, no preamble."
+    )
 
-    t = float(t_nums[0])
-    b = float(b_nums[0])
+    user_msg = json.dumps(pairs, ensure_ascii=False, indent=2)
 
-    if b >= t:
-        return True, f"Bidder offers {b_nums[0]}, required {t_nums[0]}"
-    else:
-        return False, f"Bidder offers {b_nums[0]}, required {t_nums[0]}"
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user",   "content": user_msg},
+        ],
+        temperature=0.0,
+    )
 
-
-# ─────────────────────────────────────────────
-# EXTRACT GST FROM SCANNER OUTPUT
-# ─────────────────────────────────────────────
-
-def _find_gst_in_scan(scan_data):
-    """
-    Look for a GST number anywhere in the scanner output.
-    Scanner doesn't explicitly label it, so we search all string values.
-    """
-    text = json.dumps(scan_data)
-    match = re.search(r"\b\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]\b", text)
-    return match.group(0) if match else None
-
-
-def _find_pan_in_scan(scan_data):
-    """Look for a PAN number anywhere in the scanner output."""
-    text = json.dumps(scan_data)
-    match = re.search(r"\b[A-Z]{5}\d{4}[A-Z]\b", text)
-    return match.group(0) if match else None
-
-
-# ─────────────────────────────────────────────
-# MAIN VERDICT FUNCTION
-# ─────────────────────────────────────────────
-
-def get_verdict(tender_data, bidder_data, bidder_name="bidder"):
-    """
-    Compare bidder scan output against tender scan output.
-
-    Both tender_data and bidder_data are the raw dicts returned by
-    TenderScanner.extract_from_pdf() — no wrapper, no "fields" key.
-
-    Returns:
-      {
-        "bidder_id":      str,
-        "overall_status": "ELIGIBLE" | "NOT ELIGIBLE" | "FLAGGED FOR REVIEW",
-        "reasons":        [str, ...],   # only issues — what went wrong
-        "audit_detail":   [dict, ...],  # every check for audit trail
-        "company_info":   dict          # from GST API
-      }
-    """
-    reasons = []
-    detail  = []
-
-    tender_items = tender_data.get("materials_required", [])
-    bidder_items  = bidder_data.get("materials_required", [])
-
-    # ── 1. DOCUMENT QUALITY ───────────────────────────────────────
-    # Scanner doesn't return a confidence score yet —
-    # flag if materials list is completely empty (likely bad scan)
-    if not bidder_items:
-        reasons.append(
-            "No materials or specifications could be extracted from bidder document — "
-            "document may be unreadable or incorrectly formatted"
-        )
-        detail.append({
-            "check":    "Document Readability",
-            "result":   "FLAG",
-            "required": "Readable document with specification data",
-            "found":    "No data extracted"
-        })
-    else:
-        detail.append({
-            "check":    "Document Readability",
-            "result":   "PASS",
-            "required": "Readable document",
-            "found":    f"{len(bidder_items)} item(s) extracted"
-        })
-
-    # ── 2. COMPANY LEGITIMACY — GST check ────────────────────────
-    bidder_gst = _find_gst_in_scan(bidder_data)
-    bidder_pan = _find_pan_in_scan(bidder_data)
-    gst_result = verify_gstin(bidder_gst)
-
-    if gst_result["found"] is False:
-        reasons.append(
-            f"GST verification failed — {gst_result.get('detail', gst_result['status'])}"
-        )
-        detail.append({
-            "check":    "GST Verification",
-            "result":   "FAIL",
-            "required": "Valid active GSTIN",
-            "found":    bidder_gst or "Not found",
-            "note":     gst_result.get("detail", gst_result["status"])
-        })
-    elif gst_result["found"] is True:
-        if gst_result["status"] != "Active":
-            reasons.append(
-                f"GST registration for '{gst_result.get('company_name', bidder_gst)}' "
-                f"is {gst_result['status']} — company may not be active"
-            )
-            detail.append({
-                "check":    "GST Verification",
-                "result":   "FLAG",
-                "required": "Active GSTIN",
-                "found":    bidder_gst,
-                "note":     f"Status: {gst_result['status']}"
-            })
-        else:
-            detail.append({
-                "check":    "GST Verification",
-                "result":   "PASS",
-                "required": "Active GSTIN",
-                "found":    bidder_gst,
-                "note":     f"{gst_result.get('company_name','')} — Active"
-            })
-    else:
-        # API not configured — format was valid, note it
-        detail.append({
-            "check":    "GST Verification",
-            "result":   "PASS",
-            "required": "Valid GSTIN format",
-            "found":    bidder_gst or "Not found",
-            "note":     gst_result.get("detail", "Format validated only")
-        })
-
-    # PAN check
-    if not bidder_pan:
-        reasons.append("PAN number not found in bidder document")
-        detail.append({
-            "check": "PAN Number", "result": "FLAG",
-            "required": "Valid PAN", "found": "Not found"
-        })
-    elif not re.match(r"^[A-Z]{5}\d{4}[A-Z]$", bidder_pan.upper()):
-        reasons.append(f"PAN number '{bidder_pan}' has invalid format")
-        detail.append({
-            "check": "PAN Number", "result": "FAIL",
-            "required": "Valid PAN format", "found": bidder_pan
-        })
-    else:
-        detail.append({
-            "check": "PAN Number", "result": "PASS",
-            "required": "Valid PAN", "found": bidder_pan
-        })
-
-    # ── 3. BUDGET / FINANCIAL CHECK ───────────────────────────────
-    tender_budget = tender_data.get("budget", "0")
-    bidder_budget = bidder_data.get("budget", "0")
+    raw = response.choices[0].message.content.strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
 
     try:
-        t_budget = float(str(tender_budget).replace(",", "")) if tender_budget != "0.00" else None
-        b_budget = float(str(bidder_budget).replace(",", "")) if bidder_budget != "0.00" else None
-
-        if t_budget and b_budget:
-            if b_budget >= t_budget:
-                detail.append({
-                    "check":    "Budget / Financials",
-                    "result":   "PASS",
-                    "required": f"{tender_budget}",
-                    "found":    f"{bidder_budget}"
-                })
-            else:
-                reasons.append(
-                    f"Bidder financials ({bidder_budget}) are below the tender value ({tender_budget})"
-                )
-                detail.append({
-                    "check":    "Budget / Financials",
-                    "result":   "FAIL",
-                    "required": f"{tender_budget}",
-                    "found":    f"{bidder_budget}"
-                })
-        else:
-            detail.append({
-                "check":  "Budget / Financials",
-                "result": "FLAG",
-                "required": str(tender_budget),
-                "found":    str(bidder_budget) if bidder_budget else "Not stated",
-                "note":   "Could not compare — value missing or unparseable"
-            })
+        verdicts = json.loads(raw)
     except Exception:
-        detail.append({
-            "check": "Budget / Financials", "result": "FLAG",
-            "note":  "Could not parse budget values"
-        })
+        # If LLM output is unparseable, mark everything as needing review
+        verdicts = [
+            {"match": False, "reason": "LLM output could not be parsed — manual review required."}
+            for _ in pairs
+        ]
 
-    # ── 4. MATERIALS / SPECIFICATIONS — the core comparison ───────
-    if not tender_items:
-        detail.append({
-            "check":  "Materials Comparison",
-            "result": "FLAG",
-            "note":   "No materials extracted from tender — cannot compare"
-        })
-    else:
-        unmatched_count = 0
+    # Merge verdicts back into the pairs list
+    for pair, verdict in zip(pairs, verdicts):
+        pair["match"]  = verdict.get("match", False)
+        pair["reason"] = verdict.get("reason", "No reason provided.")
 
-        for t_item in tender_items:
-            t_name = t_item.get("item", "")
-            t_qty  = t_item.get("quantity", "")
-            t_det  = t_item.get("details", "")
+    return pairs
 
-            if not t_name:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main verdict engine
+# ─────────────────────────────────────────────────────────────────────────────
+
+class VerdictEngine:
+
+    def __init__(self):
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "GROQ_API_KEY not set. Add it to your .env file:\n"
+                "  GROQ_API_KEY=gsk_..."
+            )
+        self.client = Groq(api_key=api_key)
+
+    # ── public entry point ────────────────────────────────────────────────────
+
+    def compare(self, tender: dict, bidder: dict) -> dict:
+        """
+        Compare tender and bidder dicts (both from scanner.py output).
+        Returns a structured verdict report.
+        """
+        conflicts      = []   # critical mismatches
+        notes          = []   # informational mismatches
+        text_pairs     = []   # queued for LLM batch call
+        python_results = []   # already decided by Python logic
+
+        all_fields = set(tender.keys()) | set(bidder.keys())
+
+        for field in sorted(all_fields):
+            t_val = tender.get(field)
+            b_val = bidder.get(field)
+            is_critical = field in CRITICAL_FIELDS
+
+            # ── Both null / missing — skip ────────────────────────────────────
+            if self._is_empty(t_val) and self._is_empty(b_val):
                 continue
 
-            # Find matching item in bidder's list
-            matched_bidder_item = next(
-                (b for b in bidder_items if _items_match(t_name, b.get("item", ""))),
-                None
-            )
+            # ── One side missing ──────────────────────────────────────────────
+            if self._is_empty(t_val) or self._is_empty(b_val):
+                entry = {
+                    "field":    field,
+                    "tender":   self._display(t_val),
+                    "bidder":   self._display(b_val),
+                    "reason":   "Field present in one document but missing in the other.",
+                    "critical": is_critical,
+                }
+                (conflicts if is_critical else notes).append(entry)
+                continue
 
-            if matched_bidder_item is None:
-                unmatched_count += 1
-                detail.append({
-                    "check":    f"Item: {t_name[:50]}",
-                    "result":   "FLAG",
-                    "required": f"qty: {t_qty} | {t_det}",
-                    "found":    "Not found in bidder document"
+            # ── Numeric fields — Python ───────────────────────────────────────
+            if field in NUMERIC_FIELDS:
+                match = _amounts_match(str(t_val), str(b_val))
+                python_results.append({
+                    "field":    field,
+                    "tender":   self._display(t_val),
+                    "bidder":   self._display(b_val),
+                    "match":    match,
+                    "reason":   "Numeric values match within 1% tolerance." if match
+                                else f"Numeric mismatch: tender={t_val}, bidder={b_val}.",
+                    "critical": is_critical,
                 })
-            else:
-                b_qty  = matched_bidder_item.get("quantity", "")
-                b_det  = matched_bidder_item.get("details", "")
-                b_name = matched_bidder_item.get("item", "")
+                continue
 
-                # Compare quantities
-                qty_match, qty_note = _quantities_match(t_qty, b_qty)
+            # ── Date fields — Python ──────────────────────────────────────────
+            if field in DATE_FIELDS:
+                match = _dates_match(str(t_val), str(b_val))
+                python_results.append({
+                    "field":    field,
+                    "tender":   self._display(t_val),
+                    "bidder":   self._display(b_val),
+                    "match":    match,
+                    "reason":   "Dates match." if match
+                                else f"Date mismatch: tender={t_val}, bidder={b_val}.",
+                    "critical": is_critical,
+                })
+                continue
 
-                if qty_match is False:
-                    reasons.append(
-                        f"Item '{t_name[:40]}' — quantity mismatch: {qty_note}"
-                    )
-                    detail.append({
-                        "check":    f"Item: {t_name[:50]}",
-                        "result":   "FAIL",
-                        "required": f"qty: {t_qty}",
-                        "found":    f"qty: {b_qty}",
-                        "note":     qty_note
-                    })
-                elif qty_match is None:
-                    detail.append({
-                        "check":    f"Item: {t_name[:50]}",
-                        "result":   "FLAG",
-                        "required": f"qty: {t_qty} | {t_det}",
-                        "found":    f"qty: {b_qty} | {b_det}",
-                        "note":     qty_note
-                    })
-                else:
-                    detail.append({
-                        "check":    f"Item: {t_name[:50]}",
-                        "result":   "PASS",
-                        "required": f"qty: {t_qty}",
-                        "found":    f"qty: {b_qty}",
-                        "note":     qty_note
-                    })
+            # ── Everything else — queue for LLM ──────────────────────────────
+            text_pairs.append({
+                "field":    field,
+                "tender":   self._display(t_val),
+                "bidder":   self._display(b_val),
+                "critical": is_critical,
+            })
 
-        if unmatched_count > 0:
-            reasons.append(
-                f"{unmatched_count} item(s) required by the tender were not found "
-                f"in the bidder's submission"
-            )
+        # ── Single LLM call for all text fields ───────────────────────────────
+        if text_pairs:
+            _llm_compare_fields(text_pairs, self.client)
 
-    # ── FINAL VERDICT ─────────────────────────────────────────────
-    hard_fails = [r for r in reasons if any(k in r.lower() for k in
-                  ["failed", "invalid", "below", "mismatch", "not found in bidder"])]
+        # ── Assemble results ──────────────────────────────────────────────────
+        for result in python_results + text_pairs:
+            if not result.get("match", True):
+                target = conflicts if result["critical"] else notes
+                target.append({
+                    "field":    result["field"],
+                    "tender":   result["tender"],
+                    "bidder":   result["bidder"],
+                    "reason":   result["reason"],
+                    "critical": result["critical"],
+                })
 
-    if hard_fails:
-        overall = "NOT ELIGIBLE"
-    elif reasons:
-        overall = "FLAGGED FOR REVIEW"
-    else:
-        overall = "ELIGIBLE"
+        # ── Final verdict ─────────────────────────────────────────────────────
+        status = "FLAGGED" if conflicts else "PASSED"
 
-    return {
-        "bidder_id":      bidder_name,
-        "overall_status": overall,
-        "reasons":        reasons,
-        "audit_detail":   detail,
-        "company_info": {
-            "name":       gst_result.get("company_name"),
-            "type":       gst_result.get("company_type"),
-            "gst_status": gst_result.get("status"),
-            "state":      gst_result.get("state"),
-            "reg_date":   gst_result.get("reg_date"),
+        return {
+            "verdict":   status,
+            "conflicts": conflicts,   # critical mismatches — need manual review
+            "notes":     notes,       # informational mismatches — softer
+            "summary":   self._summary(status, conflicts, notes),
         }
-    }
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_empty(val) -> bool:
+        if val is None:
+            return True
+        if isinstance(val, str) and val.strip() in ("", "null", "None"):
+            return True
+        if isinstance(val, (list, dict)) and not val:
+            return True
+        return False
+
+    @staticmethod
+    def _display(val) -> str:
+        if val is None:
+            return "—"
+        if isinstance(val, (list, dict)):
+            return json.dumps(val, ensure_ascii=False)
+        return str(val)
+
+    @staticmethod
+    def _summary(status: str, conflicts: list, notes: list) -> str:
+        if status == "PASSED":
+            if notes:
+                return (
+                    f"Bidder PASSED. No critical mismatches found. "
+                    f"{len(notes)} minor informational discrepancy(ies) noted."
+                )
+            return "Bidder PASSED. All fields match the tender requirements."
+        return (
+            f"Bidder FLAGGED for manual review. "
+            f"{len(conflicts)} critical conflict(s) and "
+            f"{len(notes)} informational discrepancy(ies) found."
+        )
 
 
-# ─────────────────────────────────────────────
-# PRINT
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Output formatter
+# ─────────────────────────────────────────────────────────────────────────────
 
-def print_verdict(verdict):
-    symbol = {"ELIGIBLE": "✓", "NOT ELIGIBLE": "✗", "FLAGGED FOR REVIEW": "⚠"}.get(
-        verdict["overall_status"], "?")
+class VerdictFormatter:
 
-    print(f"\n{'═'*55}")
-    print(f"  BIDDER  : {verdict['bidder_id']}")
+    def display(self, report: dict):
+        verdict = report["verdict"]
+        print("\n" + "=" * 60)
+        print(f"  VERDICT: {verdict}")
+        print("=" * 60)
+        print(f"\n  {report['summary']}\n")
 
-    info = verdict.get("company_info", {})
-    if info.get("name"):
-        print(f"  COMPANY : {info['name']} ({info.get('type','')})")
-        print(f"  GST     : {info.get('gst_status','')} | {info.get('state','')} | Reg: {info.get('reg_date','')}")
+        if report["conflicts"]:
+            print("── CRITICAL CONFLICTS (manual review required) ──────────────")
+            for i, c in enumerate(report["conflicts"], 1):
+                print(f"\n  [{i}] Field     : {c['field']}")
+                print(f"      Tender    : {c['tender']}")
+                print(f"      Bidder    : {c['bidder']}")
+                print(f"      Reason    : {c['reason']}")
 
-    print(f"  VERDICT : {symbol}  {verdict['overall_status']}")
-    print(f"{'═'*55}")
+        if report["notes"]:
+            print("\n── INFORMATIONAL NOTES ──────────────────────────────────────")
+            for i, n in enumerate(report["notes"], 1):
+                print(f"\n  [{i}] Field     : {n['field']}")
+                print(f"      Tender    : {n['tender']}")
+                print(f"      Bidder    : {n['bidder']}")
+                print(f"      Reason    : {n['reason']}")
 
-    if not verdict["reasons"]:
-        print("  All checks passed. Bidder is eligible.")
-    else:
-        print(f"  ISSUES ({len(verdict['reasons'])}):")
-        for i, r in enumerate(verdict["reasons"], 1):
-            print(f"  {i}. {r}")
-    print()
+        print("\n" + "=" * 60 + "\n")
 
 
-# ─────────────────────────────────────────────
-# RUN — python verdict.py tender.pdf bidder.pdf
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Standalone runner (for testing without main.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_verdict(tender_data: dict, bidder_data: dict) -> dict:
+    engine    = VerdictEngine()
+    report    = engine.compare(tender_data, bidder_data)
+    VerdictFormatter().display(report)
+    return report
+
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python verdict.py <tender.pdf> <bidder.pdf>")
-        print("\nRunning with dummy data instead...\n")
+    import sys
 
-        # Dummy data matching scanner.py output format exactly
-        DUMMY_TENDER = {
-            "issuing_authority": "CRPF HQ New Delhi",
-            "opening_date":      "15/05/2026",
-            "budget":            "4200000",
-            "materials_required": [
-                {"item": "T-Shirt Half Sleeves Round Neck Disruptive Pattern", "quantity": "500",  "details": "92% Polyester 8% Lycra"},
-                {"item": "Packaging Polybag Transparent",                       "quantity": "500",  "details": "35cm x 27cm"},
-                {"item": "Cardboard Box Recycled",                              "quantity": "100",  "details": "300 gsm 26cm x 22cm"},
-            ]
-        }
+    if len(sys.argv) != 3:
+        print("Usage: python verdict.py tender_output.json bidder_output.json")
+        sys.exit(1)
 
-        DUMMY_BIDDER_GOOD = {
-            "issuing_authority": "N/A",
-            "opening_date":      "N/A",
-            "budget":            "5000000",
-            "materials_required": [
-                {"item": "T-Shirt Round Neck Disruptive Half Sleeve",  "quantity": "500",  "details": "92% Polyester 8% Lycra GSTIN:27AAPFU0939F1ZV PAN:AAPFU0939F"},
-                {"item": "Transparent Polybag Packaging",              "quantity": "500",  "details": "35cm x 27cm"},
-                {"item": "Recycled Cardboard Box",                     "quantity": "100",  "details": "300gsm"},
-            ]
-        }
+    with open(sys.argv[1], encoding="utf-8") as f:
+        tender_json = json.load(f)
+    with open(sys.argv[2], encoding="utf-8") as f:
+        bidder_json = json.load(f)
 
-        DUMMY_BIDDER_BAD = {
-            "issuing_authority": "N/A",
-            "opening_date":      "N/A",
-            "budget":            "3000000",
-            "materials_required": [
-                {"item": "T-Shirt Round Neck",  "quantity": "300",  "details": "80% Polyester GSTIN:BADINVALID123"},
-                # Missing other items
-            ]
-        }
-
-        print("─"*55)
-        print("  CRPF TENDER EVALUATION — VERDICT ENGINE")
-        print("─"*55)
-        print_verdict(get_verdict(DUMMY_TENDER, DUMMY_BIDDER_GOOD, "GoodBidder_Co"))
-        print_verdict(get_verdict(DUMMY_TENDER, DUMMY_BIDDER_BAD,  "BadBidder_Co"))
-
-    else:
-        # Real usage — scan both files and compare
-        from scanner import TenderScanner
-
-        scanner     = TenderScanner()
-        tender_data = scanner.extract_from_pdf(sys.argv[1])
-        bidder_data  = scanner.extract_from_pdf(sys.argv[2])
-
-        print(f"\nTender  : {sys.argv[1]}")
-        print(f"Bidder  : {sys.argv[2]}\n")
-
-        verdict = get_verdict(tender_data, bidder_data, bidder_name=sys.argv[2])
-        print_verdict(verdict)
-
-        # Full JSON output for audit
-        print("\n── FULL AUDIT DETAIL " + "─"*35)
-        print(json.dumps(verdict["audit_detail"], indent=2))
+    run_verdict(tender_json, bidder_json)

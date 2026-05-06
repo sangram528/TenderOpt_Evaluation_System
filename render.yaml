@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: tenderopt-evaluation-system
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn "main:create_app()"
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+    packages:
+      - tesseract-ocr

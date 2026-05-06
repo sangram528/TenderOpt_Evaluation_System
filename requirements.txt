@@ -1,0 +1,9 @@
+flask
+gunicorn
+groq
+pymupdf
+pytesseract
+opencv-python-headless
+pillow
+numpy
+python-dotenv
