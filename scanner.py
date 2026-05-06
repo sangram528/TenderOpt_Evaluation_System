@@ -325,7 +325,7 @@ class LLMExtractor:
                 "  GROQ_API_KEY=gsk_..."
             )
         self.client = Groq(api_key=api_key)
-        self.model  = "llama-3.3-70b-versatile"
+        self.model  = "llama-3.1-8b-instant"
 
     def _build_text_window(self, text: str) -> str:
         """
