@@ -26,7 +26,7 @@ let tenderFile  = null;
 let bidderFiles = [];
 
 
-// ── TENDER ZONE (single file) ────────────────────────────────────
+// ── TENDER ZONE  ────────────────────────────────────
 (function () {
   const zone  = document.getElementById('dropA');
   const input = document.getElementById('fileA');
@@ -54,7 +54,7 @@ let bidderFiles = [];
 })();
 
 
-// ── BIDDER ZONE (multiple files) ─────────────────────────────────
+// ── BIDDER ZONE  ─────────────────────────────────
 (function () {
   const zone   = document.getElementById('dropB');
   const input  = document.getElementById('fileB');
@@ -127,7 +127,7 @@ let bidderFiles = [];
 })();
 
 
-// ── PROCESSING OVERLAY ───────────────────────────────────────────
+
 const procOverlay = document.getElementById('procOverlay');
 const procStep    = document.getElementById('procStep');
 const procFill    = document.getElementById('procFill');
@@ -170,7 +170,7 @@ document.getElementById('analyseBtn').addEventListener('click', async () => {
 
   showOverlay();
 
-  // ── Step 1: Scan tender document ONCE ────────────────────────
+
   setStage(10, 'Scanning tender document…', 1);
 
   let sessionId = null;
@@ -196,7 +196,7 @@ document.getElementById('analyseBtn').addEventListener('click', async () => {
 
   setStage(25, 'Tender scanned. Starting bidder comparisons…', 2);
 
-  // ── Step 2: Compare each bidder using the cached tender ───────
+
   // Tender is NOT re-scanned for each bidder — zero extra tokens wasted.
   const reports = [];
 
@@ -230,7 +230,6 @@ document.getElementById('analyseBtn').addEventListener('click', async () => {
     }
   }
 
-  // ── Step 3: Done ─────────────────────────────────────────────
   setStage(100, 'Analysis complete.', 4);
 
   setTimeout(() => {
@@ -240,7 +239,6 @@ document.getElementById('analyseBtn').addEventListener('click', async () => {
 });
 
 
-// ── RENDER REPORTS ───────────────────────────────────────────────
 function renderReports(reports) {
   const list = document.getElementById('reportsList');
   list.innerHTML = '';
@@ -313,7 +311,6 @@ function makeItem(entry) {
 }
 
 
-// ── RESET ────────────────────────────────────────────────────────
 document.getElementById('resetBtn').addEventListener('click', () => {
   tenderFile  = null;
   bidderFiles = [];
@@ -335,7 +332,6 @@ document.getElementById('resetBtn').addEventListener('click', () => {
 });
 
 
-// ── HELPERS ──────────────────────────────────────────────────────
 function esc(str) {
   return String(str ?? '—')
     .replace(/&/g,'&amp;')

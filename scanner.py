@@ -1,10 +1,4 @@
-"""
-scanner.py — Government Tender Document Scanner
-================================================
-Usage:
-    python scanner.py tender.pdf
-    python scanner.py tender3.pdf
-"""
+
 
 import os
 import sys
@@ -24,18 +18,11 @@ load_dotenv()
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-# For scanned PDFs, OCR only this many pages.
-# Indian government tenders always put the NIT header, EMD, cost and deadline
-# in the first 3–5 pages — no need to OCR the entire document.
 MAX_OCR_PAGES = 3
 
-# Total characters sent to the LLM
+
 LLM_TEXT_CHARS = 4000
 
-
-# =========================================================
-# STEP 1 — DOCUMENT IDENTIFIER
-# =========================================================
 
 class DocumentIdentifier:
 
@@ -88,9 +75,6 @@ class DocumentIdentifier:
         }
 
 
-# =========================================================
-# STEP 2 — UNIFIED TEXT EXTRACTION
-# =========================================================
 
 class UnifiedExtractor:
     """
@@ -109,7 +93,7 @@ class UnifiedExtractor:
             return self._extract_image(file_path)
         return self._extract_pdf(file_path, max_ocr_pages)
 
-    # ── PDF ──────────────────────────────────────────────────────────────────
+    
 
     def _extract_pdf(self, file_path: str, max_ocr_pages: int) -> dict:
         doc = fitz.open(file_path)
@@ -123,22 +107,21 @@ class UnifiedExtractor:
             text = page.get_text("text").strip()
 
             if len(text) < 50:
-                # Scanned page — OCR it, but respect the cap
                 if ocr_count >= max_ocr_pages:
-                    continue          # skip — not needed for metadata
+                    continue          
                 text = self._ocr_page(page)
                 ocr_count += 1
 
             full_text += "\n" + text
 
-            # Basic table detection
+           
             for block in page.get_text("blocks"):
                 block_text = block[4]
                 if ("\t" in block_text or "  " in block_text) and \
                    len(block_text.split()) > 5:
                     tables.append(block_text.strip())
 
-            # Heading detection (all-caps lines)
+            
             for line in text.split("\n"):
                 line = line.strip()
                 if line.isupper() and len(line) > 5:
@@ -149,10 +132,9 @@ class UnifiedExtractor:
         return {
             "raw_text": full_text.strip(),
             "tables":   tables,
-            "headings": list(dict.fromkeys(headings)),   # dedup, keep order
+            "headings": list(dict.fromkeys(headings)),   
         }
 
-    # ── Image ─────────────────────────────────────────────────────────────────
 
     def _extract_image(self, file_path: str) -> dict:
         img  = Image.open(file_path).convert("RGB")
@@ -160,7 +142,6 @@ class UnifiedExtractor:
         text = pytesseract.image_to_string(gray)
         return {"raw_text": text.strip(), "tables": [], "headings": []}
 
-    # ── OCR one fitz page ────────────────────────────────────────────────────
 
     @staticmethod
     def _ocr_page(page) -> str:
@@ -170,9 +151,6 @@ class UnifiedExtractor:
         return pytesseract.image_to_string(gray)
 
 
-# =========================================================
-# STEP 3a — DOCUMENT TYPE DETECTION (local, instant)
-# =========================================================
 
 def detect_document_type(text: str) -> str:
     """
@@ -206,7 +184,6 @@ def detect_document_type(text: str) -> str:
     p = sum(1 for s in procurement_signals if s in t)
     s = sum(1 for s in spec_signals        if s in t)
 
-    # Pure spec doc: clear spec signals, no invitation signals
     if s >= 2 and c == 0 and p == 0:
         return "spec_document"
 
@@ -222,14 +199,9 @@ def detect_document_type(text: str) -> str:
     return "generic"
 
 
-# =========================================================
-# STEP 3b — LLM STRUCTURED EXTRACTION
-# =========================================================
-
 from groq import Groq
 
 
-# ── JSON schemas per document type ───────────────────────────────────────────
 
 _SCHEMAS = {
     "civil_works": """{
@@ -285,7 +257,6 @@ _SCHEMAS = {
 }""",
 }
 
-# ── System instructions per document type ────────────────────────────────────
 
 _INSTRUCTIONS = {
     "civil_works": (
@@ -382,10 +353,6 @@ class LLMExtractor:
             return {"error": "Failed to parse LLM output", "raw_output": content}
 
 
-# =========================================================
-# STEP 4 — OUTPUT DISPLAY
-# =========================================================
-
 class JSONOutputFormatter:
 
     def display(self, structured_output):
@@ -406,10 +373,6 @@ class JSONOutputFormatter:
             except Exception:
                 print("Could not parse JSON.\n", structured_output)
 
-
-# =========================================================
-# RUNNER HELPERS
-# =========================================================
 
 def run_step1(file_path: str) -> dict:
     identifier = DocumentIdentifier()
@@ -437,16 +400,16 @@ def run_step3(text: str, doc_type: str = "generic") -> dict:
     return result
 
 
-# =========================================================
+
 # MAIN
-# =========================================================
+
 
 def main(file_path: str):
 
-    # Step 1 — identify document
+
     doc_info = run_step1(file_path)
 
-    # Warn about OCR cap upfront so the user isn't confused
+
     if doc_info.get("pdf_type") == "SCANNED_PDF":
         print(
             f"\n[INFO] Scanned PDF — {doc_info['total_pages']} total pages. "
@@ -454,7 +417,7 @@ def main(file_path: str):
             "All key tender metadata appears in the opening pages."
         )
 
-    # Step 2 — extract text
+
     extraction_data = run_step2(file_path)
     raw_text        = extraction_data["raw_text"]
 
@@ -462,14 +425,14 @@ def main(file_path: str):
         print("\n[ERROR] No text could be extracted from this document.")
         return
 
-    # Step 3a — detect document type (local, instant, no API call)
+    
     doc_type = detect_document_type(raw_text)
     print(f"\n[INFO] Document type detected: {doc_type}")
 
-    # Step 3b — LLM structured extraction with type-aware prompt
+    
     structured_output = run_step3(raw_text, doc_type)
 
-    # Step 4 — display
+   
     JSONOutputFormatter().display(structured_output)
 
 

@@ -1,25 +1,3 @@
-"""
-main.py — Tender Compliance System
-====================================
-Wires together scanner.py and verdict.py.
-
-CLI usage (testing):
-    python main.py tender.pdf bidder.pdf
-
-Flask usage (deployment):
-    gunicorn "main:create_app()"
-
-    POST /scan-tender
-        multipart/form-data with field:
-            tender  — PDF or image file
-        Returns JSON { session_id: "..." }
-
-    POST /compare-bidder
-        multipart/form-data with fields:
-            session_id — from /scan-tender
-            bidder     — PDF or image file
-        Returns JSON verdict report.
-"""
 
 import os
 import sys
@@ -35,9 +13,6 @@ from scanner import (
 from verdict import run_verdict
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Core pipeline helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def scan_document(file_path: str, label: str) -> dict:
     """
@@ -84,9 +59,6 @@ def run_pipeline(tender_path: str, bidder_path: str) -> dict:
     return run_verdict(tender_data, bidder_data)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI mode
-# ─────────────────────────────────────────────────────────────────────────────
 
 def run_cli():
     if len(sys.argv) != 3:
@@ -107,19 +79,13 @@ def run_cli():
         sys.exit(1)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Flask mode
-# ─────────────────────────────────────────────────────────────────────────────
-
 def create_app():
     from flask import Flask, request, jsonify, render_template
 
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # 32 MB
 
-    # In-memory tender cache: { session_id: tender_data_dict }
-    # Each entry is populated by /scan-tender and consumed by /compare-bidder.
-    # On Render's free tier (single worker) this lives for the process lifetime.
+
     tender_cache = {}
 
     ALLOWED_EXTENSIONS = {"pdf", "jpg", "jpeg", "png", "tiff", "bmp", "webp"}
@@ -142,7 +108,7 @@ def create_app():
             except OSError:
                 pass
 
-    # ── routes ────────────────────────────────────────────────────────────────
+
 
     @app.route("/")
     def index():
@@ -209,7 +175,7 @@ def create_app():
         finally:
             cleanup(bidder_path)
 
-    # Keep the old /compare route working for CLI testers / backwards compat
+    
     @app.route("/compare", methods=["POST"])
     def compare():
         if "tender" not in request.files or "bidder" not in request.files:
@@ -229,7 +195,7 @@ def create_app():
             report = run_pipeline(tender_path, bidder_path)
             return jsonify(report), 200
         except ValueError as e:
-            return jsonify({"error": str(e)}), 422
+            return jsonify({"error": str(e)}), 422  
         except Exception as e:
             return jsonify({"error": f"Internal error: {str(e)}"}), 500
         finally:
@@ -238,9 +204,6 @@ def create_app():
     return app
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     if len(sys.argv) >= 2:

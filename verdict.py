@@ -1,26 +1,4 @@
-"""
-verdict.py — Tender vs Bidder Comparison Engine
-================================================
-Takes two scanner.py output dicts (tender + bidder) and returns a verdict.
 
-Verdict:
-  PASSED   — all fields match within acceptable tolerance
-  FLAGGED  — one or more mismatches found; conflicting points listed
-
-Comparison strategy:
-  • CRITICAL fields  (emd_amount, estimated_cost/budget, submission_deadline,
-                      delivery_period, eligibility, key_performance_specs,
-                      materials_required, quantity)
-      → Any mismatch here = FLAGGED, regardless of severity.
-
-  • INFORMATIONAL fields (everything else)
-      → Mismatch noted in the report but does not change PASSED to FLAGGED.
-
-  Numeric / amount fields  → Python normalisation (strips ₹, Rs., commas,
-                              lakhs/crores expansion) then numeric comparison.
-  Date fields              → Python parsing across common Indian date formats.
-  Text / list fields       → LLM semantic judge via Groq (single batched call).
-"""
 
 import os
 import re
@@ -32,10 +10,6 @@ from groq import Groq
 from dotenv import load_dotenv
 
 load_dotenv()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Field classification
-# ─────────────────────────────────────────────────────────────────────────────
 
 CRITICAL_FIELDS = {
     "emd_amount",
@@ -63,9 +37,6 @@ DATE_FIELDS = {
     "date_of_issue",
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Numeric normalisation
-# ─────────────────────────────────────────────────────────────────────────────
 
 _LAKH  = 1_00_000
 _CRORE = 1_00_00_000
@@ -84,14 +55,13 @@ def _parse_amount(value: str) -> float | None:
     s = s.replace(",", "").replace("₹", "").replace("rs.", "").replace("rs", "")
     s = s.strip()
 
-    # Detect unit multiplier words before stripping them
     multiplier = 1
     if re.search(r"crore|cr\b", s):
         multiplier = _CRORE
     elif re.search(r"lakh|lac\b|l\b", s):
         multiplier = _LAKH
 
-    # Pull out the leading number
+
     m = re.search(r"[\d]+(?:\.\d+)?", s)
     if not m:
         return None
@@ -109,7 +79,6 @@ def _amounts_match(a: str, b: str, tolerance: float = 0.01) -> bool:
     """
     na, nb = _parse_amount(a), _parse_amount(b)
     if na is None or nb is None:
-        # Fall back to string similarity if parsing fails
         return SequenceMatcher(None, str(a).lower(), str(b).lower()).ratio() > 0.85
     if na == 0 and nb == 0:
         return True
@@ -118,9 +87,6 @@ def _amounts_match(a: str, b: str, tolerance: float = 0.01) -> bool:
     return abs(na - nb) / max(abs(na), abs(nb)) <= tolerance
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Date normalisation
-# ─────────────────────────────────────────────────────────────────────────────
 
 _DATE_FORMATS = [
     "%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y",
@@ -147,10 +113,6 @@ def _dates_match(a: str, b: str) -> bool:
     # Fall back to string fuzzy if parsing fails
     return SequenceMatcher(None, str(a).lower(), str(b).lower()).ratio() > 0.85
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LLM semantic comparison (single batched call for all text fields)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _llm_compare_fields(pairs: list[dict], client: Groq) -> list[dict]:
     """
@@ -195,13 +157,12 @@ def _llm_compare_fields(pairs: list[dict], client: Groq) -> list[dict]:
     try:
         verdicts = json.loads(raw)
     except Exception:
-        # If LLM output is unparseable, mark everything as needing review
         verdicts = [
             {"match": False, "reason": "LLM output could not be parsed — manual review required."}
             for _ in pairs
         ]
 
-    # Merge verdicts back into the pairs list
+    
     for pair, verdict in zip(pairs, verdicts):
         pair["match"]  = verdict.get("match", False)
         pair["reason"] = verdict.get("reason", "No reason provided.")
@@ -209,9 +170,7 @@ def _llm_compare_fields(pairs: list[dict], client: Groq) -> list[dict]:
     return pairs
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main verdict engine
-# ─────────────────────────────────────────────────────────────────────────────
+
 
 class VerdictEngine:
 
@@ -224,7 +183,6 @@ class VerdictEngine:
             )
         self.client = Groq(api_key=api_key)
 
-    # ── public entry point ────────────────────────────────────────────────────
 
     def compare(self, tender: dict, bidder: dict) -> dict:
         """
@@ -242,12 +200,10 @@ class VerdictEngine:
             t_val = tender.get(field)
             b_val = bidder.get(field)
             is_critical = field in CRITICAL_FIELDS
-
-            # ── Both null / missing — skip ────────────────────────────────────
+            
             if self._is_empty(t_val) and self._is_empty(b_val):
                 continue
 
-            # ── One side missing ──────────────────────────────────────────────
             if self._is_empty(t_val) or self._is_empty(b_val):
                 entry = {
                     "field":    field,
@@ -259,7 +215,6 @@ class VerdictEngine:
                 (conflicts if is_critical else notes).append(entry)
                 continue
 
-            # ── Numeric fields — Python ───────────────────────────────────────
             if field in NUMERIC_FIELDS:
                 match = _amounts_match(str(t_val), str(b_val))
                 python_results.append({
@@ -273,7 +228,6 @@ class VerdictEngine:
                 })
                 continue
 
-            # ── Date fields — Python ──────────────────────────────────────────
             if field in DATE_FIELDS:
                 match = _dates_match(str(t_val), str(b_val))
                 python_results.append({
@@ -286,8 +240,7 @@ class VerdictEngine:
                     "critical": is_critical,
                 })
                 continue
-
-            # ── Everything else — queue for LLM ──────────────────────────────
+            
             text_pairs.append({
                 "field":    field,
                 "tender":   self._display(t_val),
@@ -295,11 +248,9 @@ class VerdictEngine:
                 "critical": is_critical,
             })
 
-        # ── Single LLM call for all text fields ───────────────────────────────
         if text_pairs:
             _llm_compare_fields(text_pairs, self.client)
 
-        # ── Assemble results ──────────────────────────────────────────────────
         for result in python_results + text_pairs:
             if not result.get("match", True):
                 target = conflicts if result["critical"] else notes
@@ -311,7 +262,6 @@ class VerdictEngine:
                     "critical": result["critical"],
                 })
 
-        # ── Final verdict ─────────────────────────────────────────────────────
         status = "FLAGGED" if conflicts else "PASSED"
 
         return {
@@ -321,7 +271,6 @@ class VerdictEngine:
             "summary":   self._summary(status, conflicts, notes),
         }
 
-    # ── helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod
     def _is_empty(val) -> bool:
@@ -357,10 +306,6 @@ class VerdictEngine:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Output formatter
-# ─────────────────────────────────────────────────────────────────────────────
-
 class VerdictFormatter:
 
     def display(self, report: dict):
@@ -389,9 +334,7 @@ class VerdictFormatter:
         print("\n" + "=" * 60 + "\n")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Standalone runner (for testing without main.py)
-# ─────────────────────────────────────────────────────────────────────────────
+
 
 def run_verdict(tender_data: dict, bidder_data: dict) -> dict:
     engine    = VerdictEngine()
