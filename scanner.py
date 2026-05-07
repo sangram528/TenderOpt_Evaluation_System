@@ -15,8 +15,7 @@ import cv2
 import numpy as np
 from PIL import Image
 from dotenv import load_dotenv
-from rapidocr_onnxruntime import RapidOCR
-_ocr_reader = RapidOCR()
+import pytesseract
 
 load_dotenv()
 
@@ -156,23 +155,19 @@ class UnifiedExtractor:
     # ── Image ─────────────────────────────────────────────────────────────────
 
     def _extract_image(self, file_path: str) -> dict:
-        img    = Image.open(file_path).convert("RGB")
-        gray   = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
-        result, _ = _ocr_reader(gray)
-        text = " ".join([line[1] for line in result]) if result else ""
+        img  = Image.open(file_path).convert("RGB")
+        gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
+        text = pytesseract.image_to_string(gray)
         return {"raw_text": text.strip(), "tables": [], "headings": []}
 
     # ── OCR one fitz page ────────────────────────────────────────────────────
 
     @staticmethod
     def _ocr_page(page) -> str:
-        pix    = page.get_pixmap(dpi=300)
-        img    = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        gray   = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
-        result, _ = _ocr_reader(gray)
-        if not result:
-            return ""
-        return " ".join([line[1] for line in result])
+        pix  = page.get_pixmap(dpi=300)
+        img  = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
+        return pytesseract.image_to_string(gray)
 
 
 # =========================================================

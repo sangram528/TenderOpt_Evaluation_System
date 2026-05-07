@@ -2,7 +2,7 @@ flask
 gunicorn
 groq
 pymupdf
-rapidocr-onnxruntime
+pytesseract
 opencv-python-headless
 pillow
 numpy
