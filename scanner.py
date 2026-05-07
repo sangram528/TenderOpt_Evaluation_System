@@ -27,10 +27,10 @@ load_dotenv()
 # For scanned PDFs, OCR only this many pages.
 # Indian government tenders always put the NIT header, EMD, cost and deadline
 # in the first 3–5 pages — no need to OCR the entire document.
-MAX_OCR_PAGES = 5
+MAX_OCR_PAGES = 3
 
 # Total characters sent to the LLM
-LLM_TEXT_CHARS = 8000
+LLM_TEXT_CHARS = 4000
 
 
 # =========================================================
@@ -164,7 +164,7 @@ class UnifiedExtractor:
 
     @staticmethod
     def _ocr_page(page) -> str:
-        pix  = page.get_pixmap(dpi=300)
+        pix  = page.get_pixmap(dpi=150)
         img  = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
         return pytesseract.image_to_string(gray)
