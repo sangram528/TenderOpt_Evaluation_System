@@ -11,6 +11,7 @@ import sys
 import json
 
 import fitz          # PyMuPDF
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import cv2
 import numpy as np
 from PIL import Image
@@ -112,62 +113,83 @@ class UnifiedExtractor:
     # ── PDF ──────────────────────────────────────────────────────────────────
 
     def _extract_pdf(self, file_path: str, max_ocr_pages: int) -> dict:
-        doc = fitz.open(file_path)
-        full_text = ""
-        tables    = []
-        headings  = []
-        ocr_count = 0
+        doc        = fitz.open(file_path)
+        tables     = []
+        headings   = []
+        ocr_jobs   = {}   # page_num -> pixmap bytes for parallel OCR
+        text_pages = {}   # page_num -> text (already extracted)
 
+        # ── Pass 1: grab native text; queue scanned pages for OCR ────────────
+        ocr_count = 0
         for page_num in range(len(doc)):
             page = doc[page_num]
             text = page.get_text("text").strip()
-
-            if len(text) < 50:
-                # Scanned page — OCR it, but respect the cap
-                if ocr_count >= max_ocr_pages:
-                    continue          # skip — not needed for metadata
-                text = self._ocr_page(page)
-                ocr_count += 1
-
-            full_text += "\n" + text
-
-            # Basic table detection
-            for block in page.get_text("blocks"):
-                block_text = block[4]
-                if ("\t" in block_text or "  " in block_text) and \
-                   len(block_text.split()) > 5:
-                    tables.append(block_text.strip())
-
-            # Heading detection (all-caps lines)
-            for line in text.split("\n"):
-                line = line.strip()
-                if line.isupper() and len(line) > 5:
-                    headings.append(line)
+            if len(text) >= 50:
+                text_pages[page_num] = text
+                # table / heading detection for text pages
+                for block in page.get_text("blocks"):
+                    bt = block[4]
+                    if ("\t" in bt or "  " in bt) and len(bt.split()) > 5:
+                        tables.append(bt.strip())
+                for line in text.split("\n"):
+                    l = line.strip()
+                    if l.isupper() and len(l) > 5:
+                        headings.append(l)
+            else:
+                if ocr_count < max_ocr_pages:
+                    # Store pixmap bytes so we can release the doc lock
+                    pix = page.get_pixmap(dpi=150)
+                    ocr_jobs[page_num] = (pix.width, pix.height, pix.samples)
+                    ocr_count += 1
 
         doc.close()
+
+        # ── Pass 2: OCR scanned pages in parallel ────────────────────────────
+        def _ocr_from_bytes(page_num, width, height, samples):
+            img  = Image.frombytes("RGB", [width, height], samples)
+            cfg  = "--oem 3 --psm 6"
+            text = pytesseract.image_to_string(img, config=cfg)
+            for line in text.split("\n"):
+                l = line.strip()
+                if l.isupper() and len(l) > 5:
+                    headings.append(l)
+            return page_num, text
+
+        ocr_results = {}
+        if ocr_jobs:
+            with ThreadPoolExecutor(max_workers=min(3, len(ocr_jobs))) as ex:
+                futures = {
+                    ex.submit(_ocr_from_bytes, pn, w, h, s): pn
+                    for pn, (w, h, s) in ocr_jobs.items()
+                }
+                for future in as_completed(futures):
+                    pn, text = future.result()
+                    ocr_results[pn] = text
+
+        # ── Assemble in page order ────────────────────────────────────────────
+        all_pages = {**text_pages, **ocr_results}
+        full_text = "\n".join(all_pages[n] for n in sorted(all_pages))
 
         return {
             "raw_text": full_text.strip(),
             "tables":   tables,
-            "headings": list(dict.fromkeys(headings)),   # dedup, keep order
+            "headings": list(dict.fromkeys(headings)),
         }
 
     # ── Image ─────────────────────────────────────────────────────────────────
 
     def _extract_image(self, file_path: str) -> dict:
         img  = Image.open(file_path).convert("RGB")
-        gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
-        text = pytesseract.image_to_string(gray)
+        text = pytesseract.image_to_string(img, config="--oem 3 --psm 6")
         return {"raw_text": text.strip(), "tables": [], "headings": []}
 
     # ── OCR one fitz page ────────────────────────────────────────────────────
 
     @staticmethod
     def _ocr_page(page) -> str:
-        pix  = page.get_pixmap(dpi=150)
-        img  = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
-        return pytesseract.image_to_string(gray)
+        pix = page.get_pixmap(dpi=150)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        return pytesseract.image_to_string(img, config="--oem 3 --psm 6")
 
 
 # =========================================================
